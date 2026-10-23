@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: google.golang.org/grpc
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly

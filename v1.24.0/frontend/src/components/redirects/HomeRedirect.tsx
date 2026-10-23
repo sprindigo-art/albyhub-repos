@@ -1,0 +1,73 @@
+import React from "react";
+import { useLocation, useNavigate } from "react-router";
+import Loading from "src/components/Loading";
+import { localStorageKeys } from "src/constants";
+import { useInfo } from "src/hooks/useInfo";
+
+export function HomeRedirect() {
+  const { data: info } = useInfo();
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  React.useEffect(() => {
+    if (!info) {
+      return;
+    }
+
+    if (info.nodeMigrationFileCreated) {
+      // the hub is halted after creating a migration file and should not be
+      // used anymore, so keep showing the migration success instructions
+      navigate("/create-node-migration-file-success", { replace: true });
+      return;
+    }
+
+    const setupReturnTo = window.localStorage.getItem(
+      localStorageKeys.setupReturnTo
+    );
+
+    let to: string | undefined;
+    if (!setupReturnTo) {
+      if (info.setupCompleted && info.running) {
+        if (info.unlocked) {
+          if (info.albyAccountConnected || !info.albyUserIdentifier) {
+            const returnTo = window.localStorage.getItem(
+              localStorageKeys.returnTo
+            );
+            // setTimeout hack needed for React strict mode (in development)
+            // because the effect runs twice before the navigation occurs
+            setTimeout(() => {
+              window.localStorage.removeItem(localStorageKeys.returnTo);
+            }, 100);
+            to = returnTo || "/home";
+          } else {
+            to = "/alby/auth";
+          }
+        } else {
+          to = "/unlock";
+        }
+      } else if (info.setupCompleted && !info.running) {
+        to = "/start";
+      } else if (info.albyAccountConnected) {
+        // in case user goes back after authenticating in setup
+        // we don't want to show the intro twice
+        to = "/welcome";
+      } else {
+        to = "/intro";
+      }
+    } else {
+      // setTimeout hack needed for React strict mode (in development)
+      // because the effect runs twice before the navigation occurs
+      setTimeout(() => {
+        window.localStorage.removeItem(localStorageKeys.setupReturnTo);
+      }, 100);
+      to = setupReturnTo;
+    }
+    navigate(to, {
+      replace: true,
+    });
+  }, [info, location, navigate]);
+
+  if (!info) {
+    return <Loading />;
+  }
+}

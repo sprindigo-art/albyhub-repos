@@ -1,0 +1,214 @@
+import {
+  CirclePlusIcon,
+  HelpCircleIcon,
+  InfoIcon,
+  ShieldCheckIcon,
+  SparklesIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
+import { useRef, useState } from "react";
+import AppHeader from "src/components/AppHeader";
+import AppCard from "src/components/connections/AppCard";
+import { CustomPagination } from "src/components/CustomPagination";
+import { FormattedBitcoinAmount } from "src/components/FormattedBitcoinAmount";
+import FormattedFiatAmount from "src/components/FormattedFiatAmount";
+import Loading from "src/components/Loading";
+import ResponsiveButton from "src/components/ResponsiveButton";
+import ResponsiveLinkButton from "src/components/ResponsiveLinkButton";
+import {
+  Alert,
+  AlertAction,
+  AlertDescription,
+  AlertTitle,
+} from "src/components/ui/alert";
+import { Button } from "src/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "src/components/ui/card";
+import { ExternalLinkButton } from "src/components/ui/custom/external-link-button";
+import { LinkButton } from "src/components/ui/custom/link-button";
+import { UpgradeDialog } from "src/components/UpgradeDialog";
+import { LIST_APPS_LIMIT, MAX_FREE_SUBWALLETS } from "src/constants";
+import { useAlbyMe } from "src/hooks/useAlbyMe";
+import { useApps } from "src/hooks/useApps";
+import { useBalances } from "src/hooks/useBalances";
+import { useInfo } from "src/hooks/useInfo";
+import { SubwalletIntro } from "src/screens/subwallets/SubwalletIntro";
+
+export function SubwalletList() {
+  const { data: info } = useInfo();
+  const [page, setPage] = useState(1);
+  const appsListRef = useRef<HTMLDivElement>(null);
+  const { data: subwalletAppsData } = useApps(
+    undefined,
+    page,
+    {
+      subWallets: true,
+    },
+    "created_at"
+  );
+  const { data: albyMe, error: albyMeError } = useAlbyMe();
+  const { data: balances } = useBalances();
+
+  const handlePageChange = (page: number) => {
+    setPage(page);
+    appsListRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  };
+
+  if (
+    !info ||
+    !subwalletAppsData ||
+    !balances ||
+    (info.albyAccountConnected && !albyMe && !albyMeError)
+  ) {
+    return <Loading />;
+  }
+
+  const subwalletApps = subwalletAppsData.apps;
+
+  if (!subwalletAppsData.totalCount) {
+    return <SubwalletIntro />;
+  }
+
+  const subwalletTotalAmountMsat = subwalletAppsData.totalBalanceMsat || 0;
+  const isSufficientlyBacked =
+    subwalletTotalAmountMsat <= balances.lightning.totalSpendableMsat;
+
+  return (
+    <div className="grid gap-3">
+      <AppHeader
+        title="Sub-wallets"
+        pageTitle="Sub-wallets"
+        description="Create sub-wallets for yourself, friends, family or coworkers"
+        contentRight={
+          <>
+            <ExternalLinkButton
+              to="https://guides.getalby.com/user-guide/alby-hub/sub-wallets"
+              variant="outline"
+              size="icon"
+            >
+              <HelpCircleIcon className="size-4" />
+            </ExternalLinkButton>
+            {!albyMe?.subscription.plan_code &&
+            subwalletAppsData.totalCount >= MAX_FREE_SUBWALLETS ? (
+              <UpgradeDialog>
+                <ResponsiveButton icon={CirclePlusIcon} text="New Sub-wallet" />
+              </UpgradeDialog>
+            ) : (
+              <ResponsiveLinkButton
+                to="/sub-wallets/new"
+                icon={CirclePlusIcon}
+                text="New Sub-wallet"
+              />
+            )}
+          </>
+        }
+      />
+
+      {!albyMe?.subscription.plan_code &&
+        subwalletAppsData.totalCount >= MAX_FREE_SUBWALLETS && (
+          <Alert>
+            <InfoIcon />
+            <AlertTitle>Need more Sub-wallets?</AlertTitle>
+            <AlertDescription>
+              Upgrade to Pro for unlimited sub-wallets.
+            </AlertDescription>
+            <AlertAction>
+              <UpgradeDialog>
+                <Button size="sm">
+                  <SparklesIcon />
+                  Upgrade
+                </Button>
+              </UpgradeDialog>
+            </AlertAction>
+          </Alert>
+        )}
+
+      {!isSufficientlyBacked && (
+        <Alert variant="warning">
+          <TriangleAlertIcon />
+          <AlertTitle>
+            Sub-wallets you manage are insufficiently backed
+          </AlertTitle>
+          <AlertDescription className="flex flex-row gap-3">
+            There's not enough bitcoin in your lightning balance to honor all
+            balances of sub-wallets under your management. Increase your
+            lightning balance by opening a channel or review your channel
+            statuses to back them up again.
+            <LinkButton to="/wallet/receive" variant="secondary">
+              Deposit Bitcoin
+            </LinkButton>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      <div className="flex flex-col sm:flex-row flex-wrap gap-3 slashed-zero">
+        <Card className="flex flex-1 flex-col">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-lg">
+              Total Balance of Sub-wallets
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="grow">
+            <div className="mb-1">
+              <span className="text-2xl font-medium balance sensitive">
+                <FormattedBitcoinAmount amountMsat={subwalletTotalAmountMsat} />
+              </span>
+            </div>
+            <FormattedFiatAmount amountSat={subwalletTotalAmountMsat / 1000} />
+          </CardContent>
+        </Card>
+        <Card className="flex flex-1 flex-col">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-lg">Number of Sub-wallets</CardTitle>
+          </CardHeader>
+          <CardContent className="grow flex flex-col gap-4">
+            <div className="flex flex-col gap-2">
+              <span className="text-2xl font-medium">
+                {subwalletAppsData.totalCount} /{" "}
+                {albyMe?.subscription.plan_code ? "∞" : MAX_FREE_SUBWALLETS}
+              </span>
+              {isSufficientlyBacked ? (
+                <div className="flex items-center text-positive-foreground text-sm">
+                  <ShieldCheckIcon className="size-4 mr-2" />
+                  <span className="text-sm font-medium">Fully backed</span>
+                </div>
+              ) : (
+                <div className="flex items-center text-warning-foreground text-sm">
+                  <TriangleAlertIcon className="size-4 mr-2" />
+                  <span className="text-sm font-medium">
+                    Insufficiently backed
+                  </span>
+                </div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+      <div className="mt-8">
+        <h3 className="font-semibold text-2xl mb-4">Managed Sub-wallets</h3>
+        <div
+          ref={appsListRef}
+          className="grid grid-cols-1 lg:grid-cols-2 gap-3 items-stretch"
+        >
+          {subwalletApps.map((app, index) => (
+            <AppCard key={index} app={app} />
+          ))}
+        </div>
+      </div>
+
+      <CustomPagination
+        limit={LIST_APPS_LIMIT}
+        totalCount={subwalletAppsData.totalCount}
+        page={page}
+        handlePageChange={handlePageChange}
+      />
+    </div>
+  );
+}

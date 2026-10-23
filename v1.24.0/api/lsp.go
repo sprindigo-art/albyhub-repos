@@ -1,0 +1,183 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+
+	"github.com/getAlby/hub/alby"
+	"github.com/getAlby/hub/config"
+	"github.com/getAlby/hub/lnclient"
+	"github.com/getAlby/hub/logger"
+	"github.com/getAlby/hub/lsp"
+	"github.com/getAlby/hub/version"
+	decodepay "github.com/nbd-wtf/ln-decodepay"
+	"github.com/sirupsen/logrus"
+)
+
+func (api *api) RequestLSPOrder(ctx context.Context, request *LSPOrderRequest) (*LSPOrderResponse, error) {
+	lnClient := api.svc.GetLNClient()
+	if lnClient == nil {
+		return nil, ErrLNClientNotStarted
+	}
+
+	if request.LSPType != lsp.LSP_TYPE_LSPS1 {
+		return nil, fmt.Errorf("unsupported LSP type: %v", request.LSPType)
+	}
+
+	logger.Logger.Info("Requesting own node info")
+
+	nodeInfo, err := lnClient.GetInfo(ctx)
+	if err != nil {
+		logger.Logger.WithError(err).WithFields(logrus.Fields{
+			"lspIdentifier": request.LSPIdentifier,
+		}).Error("Failed to request own node info", err)
+		return nil, err
+	}
+
+	logger.Logger.Info("Requesting LSP info")
+	lspInfo, err := api.albyOAuthSvc.GetLSPInfo(ctx, request.LSPIdentifier, nodeInfo.Network)
+
+	if err != nil {
+		logger.Logger.WithError(err).Error("Failed to request LSP info")
+		return nil, err
+	}
+
+	logger.Logger.WithField("lspInfo", lspInfo).Info("Connecting to LSP node as a peer")
+
+	err = lnClient.ConnectPeer(ctx, &lnclient.ConnectPeerRequest{
+		Pubkey:  lspInfo.Pubkey,
+		Address: lspInfo.Address,
+		Port:    lspInfo.Port,
+	})
+
+	if err != nil {
+		logger.Logger.WithError(err).Error("Failed to connect to peer")
+		return nil, err
+	}
+
+	invoice, feeSat, err := api.requestLSPS1Invoice(ctx, lnClient, request, nodeInfo.Network, nodeInfo.Pubkey, lspInfo.MaxChannelExpiryBlocks, lspInfo.MinRequiredChannelConfirmations, lspInfo.MinFundingConfirmsWithinBlocks)
+	invoiceAmountSat := uint64(0)
+	incomingLiquiditySat := uint64(0)
+	resolvedAmountSat := ResolveToSat(request.AmountSat, nil, request.Amount, nil)
+	if resolvedAmountSat != nil {
+		incomingLiquiditySat = *resolvedAmountSat
+	}
+
+	if err != nil {
+		logger.Logger.WithError(err).Error("Failed to request invoice")
+		return nil, err
+	}
+
+	if invoice != "" {
+		paymentRequest, err := decodepay.Decodepay(invoice)
+		if err != nil {
+			logger.Logger.WithError(err).Error("Failed to decode bolt11 invoice")
+			return nil, err
+		}
+
+		invoiceAmountSat = uint64(paymentRequest.MSatoshi / 1000)
+	}
+
+	newChannelResponse := &LSPOrderResponse{
+		Invoice:              invoice,
+		Fee:                  feeSat,
+		FeeSat:               feeSat,
+		InvoiceAmount:        invoiceAmountSat,
+		InvoiceAmountSat:     invoiceAmountSat,
+		IncomingLiquidity:    incomingLiquiditySat,
+		IncomingLiquiditySat: incomingLiquiditySat,
+		OutgoingLiquidity:    uint64(0),
+		OutgoingLiquiditySat: uint64(0),
+	}
+
+	logger.Logger.WithFields(logrus.Fields{
+		"newChannelResponse": newChannelResponse,
+	}).Debug("New Channel response")
+
+	return newChannelResponse, nil
+}
+
+func (api *api) requestLSPS1Invoice(ctx context.Context, lnClient lnclient.LNClient, request *LSPOrderRequest, network, pubkey string, channelExpiryBlocks uint64, minRequiredChannelConfirmations uint64, minFundingConfirmsWithinBlocks uint64) (invoice string, feeSat uint64, err error) {
+	refundAddress, err := lnClient.GetNewOnchainAddress(ctx)
+	if err != nil {
+		logger.Logger.WithError(err).Error("Failed to request onchain address")
+		return "", 0, err
+	}
+
+	var requiredChannelConfirmations uint64 = 0
+
+	backendType, err := api.cfg.Get("LNBackendType", "")
+	if err != nil {
+		return "", 0, errors.New("failed to get LN backend type")
+	}
+
+	if backendType != config.LDKBackendType {
+		// LND does not support 0-conf by default
+		requiredChannelConfirmations = 1
+	}
+
+	// Some LSPs (e.g. Olympus) require more min confirmations, as per the spec ours must be at least as many blocks
+	requiredChannelConfirmations = max(requiredChannelConfirmations, minRequiredChannelConfirmations)
+
+	if request.Public {
+		// as per BOLT-7 6 confirmations are required for the channel to be gossiped
+		// https://github.com/lightning/bolts/blob/master/07-routing-gossip.md#requirements
+		requiredChannelConfirmations = 6
+	}
+
+	token := ""
+	if request.LSPIdentifier == "olympus" {
+		token = "AlbyHub/" + version.Tag
+	}
+
+	// set a non-empty token to notify LNServer that we support 0-conf
+	// (Pre-v1.17.2 does not support 0-conf)
+	if request.LSPIdentifier == "lnserver" {
+		token = "AlbyHub/" + version.Tag
+	}
+
+	// set a non-empty token to notify Flashsats that we support 0-conf
+	// (Pre-v1.21.0 does not support 0-conf)
+	if request.LSPIdentifier == "flashsats" {
+		token = "AlbyHub/" + version.Tag
+	}
+
+	amountSat := uint64(0)
+	resolvedAmountSat := ResolveToSat(request.AmountSat, nil, request.Amount, nil)
+	if resolvedAmountSat != nil {
+		amountSat = *resolvedAmountSat
+	}
+	lspBalanceSat := strconv.FormatUint(amountSat, 10)
+
+	lsps1ChannelRequest := &alby.LSPChannelRequest{
+		PublicKey:                    pubkey,
+		LSPBalanceSat:                lspBalanceSat,
+		ClientBalanceSat:             "0",
+		RequiredChannelConfirmations: requiredChannelConfirmations,
+		FundingConfirmsWithinBlocks:  minFundingConfirmsWithinBlocks,
+		ChannelExpiryBlocks:          channelExpiryBlocks,
+		Token:                        token,
+		RefundOnchainAddress:         refundAddress,
+		AnnounceChannel:              request.Public,
+	}
+
+	channelResponse, err := api.albyOAuthSvc.CreateLSPOrder(ctx, request.LSPIdentifier, network, lsps1ChannelRequest)
+	if err != nil {
+		return "", 0, err
+	}
+
+	if channelResponse.Payment != nil {
+		invoice = channelResponse.Payment.Bolt11.Invoice
+		feeSat, err = strconv.ParseUint(channelResponse.Payment.Bolt11.FeeTotalSat, 10, 64)
+		if err != nil {
+			logger.Logger.WithError(err).WithFields(logrus.Fields{
+				"lspIdentifier": request.LSPIdentifier,
+			}).Error("Failed to parse fee")
+			return "", 0, fmt.Errorf("failed to parse fee %v", err)
+		}
+	}
+
+	return invoice, feeSat, nil
+}

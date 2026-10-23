@@ -1,0 +1,110 @@
+import { LucideIcon, ZapIcon } from "lucide-react";
+import { useRef, useState } from "react";
+import { CustomPagination } from "src/components/CustomPagination";
+import EmptyState from "src/components/EmptyState";
+import Loading from "src/components/Loading";
+import TransactionItem from "src/components/TransactionItem";
+import { LIST_TRANSACTIONS_LIMIT } from "src/constants";
+import {
+  getTransactionsUrl,
+  hasActiveTransactionFilters,
+  useTransactions,
+} from "src/hooks/useTransactions";
+import useTransactionFiltersStore from "src/state/TransactionFiltersStore";
+
+type TransactionsListProps = {
+  appId?: number;
+  emptyIcon?: LucideIcon;
+  emptyTitle?: string;
+  emptyDescription?: string;
+  emptyVariant?: "dashed" | "muted" | "none";
+};
+
+function TransactionsList({
+  appId,
+  emptyIcon = ZapIcon,
+  emptyTitle = "No lightning payments yet",
+  emptyDescription = "Your payments will appear here as you start using your wallet.",
+  emptyVariant,
+}: TransactionsListProps) {
+  const [page, setPage] = useState(1);
+  const { filters } = useTransactionFiltersStore();
+
+  // Reset pagination during render when the filters or app change, so no
+  // request is made for a page that may not exist under the new list.
+  const [prevListIdentity, setPrevListIdentity] = useState({ appId, filters });
+  if (
+    prevListIdentity.appId !== appId ||
+    prevListIdentity.filters !== filters
+  ) {
+    setPrevListIdentity({ appId, filters });
+    setPage(1);
+  }
+
+  const transactionListRef = useRef<HTMLDivElement>(null);
+  const transactionListKey = getTransactionsUrl(
+    appId,
+    LIST_TRANSACTIONS_LIMIT,
+    page,
+    filters
+  );
+  const { data: transactionData, isLoading } = useTransactions(
+    appId,
+    false,
+    LIST_TRANSACTIONS_LIMIT,
+    page,
+    filters
+  );
+  const transactions = transactionData?.transactions || [];
+  const totalCount = transactionData?.totalCount || 0;
+  const hasActiveFilters = hasActiveTransactionFilters(filters);
+
+  const handlePageChange = (page: number) => {
+    setPage(page);
+    transactionListRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  };
+
+  if (isLoading || !transactionData) {
+    return <Loading />;
+  }
+
+  return (
+    <div ref={transactionListRef} className="flex flex-col flex-1">
+      {!transactions.length ? (
+        <EmptyState
+          icon={emptyIcon}
+          title={hasActiveFilters ? "No matching payments" : emptyTitle}
+          description={
+            hasActiveFilters
+              ? "Try changing your filters to see more payments."
+              : emptyDescription
+          }
+          variant={emptyVariant}
+        />
+      ) : (
+        <>
+          {transactions?.map((tx) => {
+            return (
+              <TransactionItem
+                key={tx.id}
+                tx={tx}
+                transactionListKey={transactionListKey}
+              />
+            );
+          })}
+          <CustomPagination
+            limit={LIST_TRANSACTIONS_LIMIT}
+            totalCount={totalCount}
+            page={page}
+            handlePageChange={handlePageChange}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+export default TransactionsList;

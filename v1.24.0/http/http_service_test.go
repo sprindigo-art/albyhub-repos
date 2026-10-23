@@ -1,0 +1,645 @@
+package http
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+
+	"github.com/getAlby/hub/api"
+	"github.com/getAlby/hub/config"
+	"github.com/getAlby/hub/constants"
+	"github.com/getAlby/hub/events"
+	"github.com/getAlby/hub/lnclient"
+	"github.com/getAlby/hub/logger"
+	"github.com/getAlby/hub/tests/db"
+	"github.com/getAlby/hub/tests/mocks"
+	"github.com/labstack/echo/v4"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+)
+
+func TestUnlock_IncorrectPassword(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "123").Return(false)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	requestBody := api.UnlockRequest{UnlockPassword: "123", Permission: "full"}
+	jsonBody, _ := json.Marshal(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json") // Set Content-Type header
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	mockConfig.AssertNotCalled(t, "GetJWTSecret")
+}
+
+func TestUnlock_UnknownPermission(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "123").Return(true)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	requestBody := api.UnlockRequest{UnlockPassword: "123", Permission: "unknown"}
+	jsonBody, _ := json.Marshal(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json") // Set Content-Type header
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	mockConfig.AssertNotCalled(t, "GetJWTSecret")
+}
+
+// TestUnlock_RateLimited verifies that repeated requests to an unlock-password
+// endpoint are throttled with HTTP 429 once the limit is exceeded.
+func TestUnlock_RateLimited(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "wrong").Return(false)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	jsonBody, _ := json.Marshal(api.UnlockRequest{UnlockPassword: "wrong", Permission: "full"})
+	send := func() int {
+		req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// the burst of 2 is served (wrong password, so unauthorized)
+	assert.Equal(t, http.StatusUnauthorized, send())
+	assert.Equal(t, http.StatusUnauthorized, send())
+	// the next request exceeds the limit and is rejected with 429
+	assert.Equal(t, http.StatusTooManyRequests, send())
+}
+
+// TestUnlock_RateLimitNotBypassedBySpoofedIP verifies that the unlock rate
+// limiter is global rather than per-IP: varying the X-Forwarded-For header per
+// request does not grant each request a fresh bucket.
+func TestUnlock_RateLimitNotBypassedBySpoofedIP(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "wrong").Return(false)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	jsonBody, _ := json.Marshal(api.UnlockRequest{UnlockPassword: "wrong", Permission: "full"})
+
+	send := func(forwardedFor string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Forwarded-For", forwardedFor)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	rateLimited := 0
+	for i := 0; i < 12; i++ {
+		// each request presents a distinct client address
+		if send("10.0.0."+strconv.Itoa(i)) == http.StatusTooManyRequests {
+			rateLimited++
+		}
+	}
+
+	assert.Positive(t, rateLimited, "spoofing X-Forwarded-For must not grant a fresh rate-limit bucket")
+}
+
+func TestGetApps_NoToken(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := mocks.NewMockEventPublisher(t)
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/apps", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestUnlock_NodeNotStarted(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "123").Return(true)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+	mockSvc.On("GetLNClient").Return(nil)
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	requestBody := api.UnlockRequest{UnlockPassword: "123", Permission: "full"}
+	jsonBody, _ := json.Marshal(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	body, err := io.ReadAll(rec.Body)
+	require.NoError(t, err)
+
+	var response ErrorResponse
+	err = json.Unmarshal(body, &response)
+	require.NoError(t, err)
+	assert.Equal(t, "Node is not running, start it before unlocking.", response.Message)
+	mockConfig.AssertNotCalled(t, "GetJWTSecret")
+}
+
+func TestGetApps_ReadonlyPermission(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "123").Return(true)
+	mockConfig.On("GetJWTSecret").Return("dummy secret", nil)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+	lnClient := mocks.NewMockLNClient(t)
+	lnClient.On("GetNodeStatus", mock.Anything).Return(&lnclient.NodeStatus{}, nil)
+	mockSvc.On("GetLNClient").Return(lnClient)
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	requestBody := api.UnlockRequest{UnlockPassword: "123", Permission: "readonly"}
+	jsonBody, _ := json.Marshal(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json") // Set Content-Type header
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	body, err := io.ReadAll(rec.Body)
+	require.NoError(t, err)
+
+	type authTokenResponse struct {
+		Token string `json:"token"`
+	}
+
+	var unlockAuthTokenResponse authTokenResponse
+	err = json.Unmarshal(body, &unlockAuthTokenResponse)
+	require.NoError(t, err)
+	assert.NotEmpty(t, unlockAuthTokenResponse.Token)
+
+	req2 := httptest.NewRequest(http.MethodGet, "/api/apps", nil)
+	req2.Header.Set("Authorization", "Bearer "+unlockAuthTokenResponse.Token)
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+
+	assert.Equal(t, http.StatusOK, rec2.Code)
+}
+
+func TestGetApps_FullPermission(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "123").Return(true)
+	mockConfig.On("GetJWTSecret").Return("dummy secret", nil)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+	lnClient := mocks.NewMockLNClient(t)
+	lnClient.On("GetNodeStatus", mock.Anything).Return(&lnclient.NodeStatus{}, nil)
+	mockSvc.On("GetLNClient").Return(lnClient)
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	requestBody := api.UnlockRequest{UnlockPassword: "123", Permission: "full"}
+	jsonBody, _ := json.Marshal(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json") // Set Content-Type header
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	body, err := io.ReadAll(rec.Body)
+	require.NoError(t, err)
+
+	type authTokenResponse struct {
+		Token string `json:"token"`
+	}
+
+	var unlockAuthTokenResponse authTokenResponse
+	err = json.Unmarshal(body, &unlockAuthTokenResponse)
+	require.NoError(t, err)
+	assert.NotEmpty(t, unlockAuthTokenResponse.Token)
+
+	req2 := httptest.NewRequest(http.MethodGet, "/api/apps", nil)
+	req2.Header.Set("Authorization", "Bearer "+unlockAuthTokenResponse.Token)
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+
+	assert.Equal(t, http.StatusOK, rec2.Code)
+}
+
+func TestCreateApp_NoToken(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := mocks.NewMockEventPublisher(t)
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	requestBody := api.CreateAppRequest{Name: "Test app", Scopes: []string{constants.PAY_INVOICE_SCOPE}}
+	jsonBody, _ := json.Marshal(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/apps", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json") // Set Content-Type header
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestCreateApp_FullPermission(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "123").Return(true)
+	mockConfig.On("GetJWTSecret").Return("dummy secret", nil)
+	mockConfig.On("GetRelayUrls").Return([]string{})
+
+	mockKeys := mocks.NewMockKeys(t)
+	mockKeys.On("GetAppWalletKey", uint(1)).Return("", nil)
+
+	mockAlbyOAuthService := mocks.NewMockAlbyOAuthService(t)
+	mockAlbyOAuthService.On("GetLightningAddress").Return("", nil)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mockKeys)
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mockAlbyOAuthService)
+	lnClient := mocks.NewMockLNClient(t)
+	lnClient.On("GetNodeStatus", mock.Anything).Return(&lnclient.NodeStatus{}, nil)
+	mockSvc.On("GetLNClient").Return(lnClient)
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	requestBody := api.UnlockRequest{UnlockPassword: "123", Permission: "full"}
+	jsonBody, _ := json.Marshal(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json") // Set Content-Type header
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	body, err := io.ReadAll(rec.Body)
+	require.NoError(t, err)
+
+	type authTokenResponse struct {
+		Token string `json:"token"`
+	}
+
+	var unlockAuthTokenResponse authTokenResponse
+	err = json.Unmarshal(body, &unlockAuthTokenResponse)
+	require.NoError(t, err)
+	assert.NotEmpty(t, unlockAuthTokenResponse.Token)
+
+	requestBody2 := api.CreateAppRequest{Name: "Test app", Scopes: []string{constants.PAY_INVOICE_SCOPE}}
+	jsonBody2, _ := json.Marshal(requestBody2)
+	req2 := httptest.NewRequest(http.MethodPost, "/api/apps", bytes.NewBuffer(jsonBody2))
+	req2.Header.Set("Authorization", "Bearer "+unlockAuthTokenResponse.Token)
+	req2.Header.Set("Content-Type", "application/json") // Set Content-Type header
+
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+
+	assert.Equal(t, http.StatusOK, rec2.Code)
+}
+
+func TestCreateApp_ReadonlyPermission(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "123").Return(true)
+	mockConfig.On("GetJWTSecret").Return("dummy secret", nil)
+
+	mockKeys := mocks.NewMockKeys(t)
+
+	mockAlbyOAuthService := mocks.NewMockAlbyOAuthService(t)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mockKeys)
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mockAlbyOAuthService)
+	lnClient := mocks.NewMockLNClient(t)
+	lnClient.On("GetNodeStatus", mock.Anything).Return(&lnclient.NodeStatus{}, nil)
+	mockSvc.On("GetLNClient").Return(lnClient)
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	requestBody := api.UnlockRequest{UnlockPassword: "123", Permission: "readonly"}
+	jsonBody, _ := json.Marshal(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json") // Set Content-Type header
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	body, err := io.ReadAll(rec.Body)
+	require.NoError(t, err)
+
+	type authTokenResponse struct {
+		Token string `json:"token"`
+	}
+
+	var unlockAuthTokenResponse authTokenResponse
+	err = json.Unmarshal(body, &unlockAuthTokenResponse)
+	require.NoError(t, err)
+	assert.NotEmpty(t, unlockAuthTokenResponse.Token)
+
+	requestBody2 := api.CreateAppRequest{Name: "Test app", Scopes: []string{constants.PAY_INVOICE_SCOPE}}
+	jsonBody2, _ := json.Marshal(requestBody2)
+	req2 := httptest.NewRequest(http.MethodPost, "/api/apps", bytes.NewBuffer(jsonBody2))
+	req2.Header.Set("Authorization", "Bearer "+unlockAuthTokenResponse.Token)
+	req2.Header.Set("Content-Type", "application/json") // Set Content-Type header
+
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+
+	assert.Equal(t, http.StatusForbidden, rec2.Code)
+}
+
+func TestGetLogOutput_ReadonlyPermission(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "123").Return(true)
+	mockConfig.On("GetJWTSecret").Return("dummy secret", nil)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+	lnClient := mocks.NewMockLNClient(t)
+	lnClient.On("GetNodeStatus", mock.Anything).Return(&lnclient.NodeStatus{}, nil)
+	mockSvc.On("GetLNClient").Return(lnClient)
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	requestBody := api.UnlockRequest{UnlockPassword: "123", Permission: "readonly"}
+	jsonBody, _ := json.Marshal(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json") // Set Content-Type header
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	body, err := io.ReadAll(rec.Body)
+	require.NoError(t, err)
+
+	type authTokenResponse struct {
+		Token string `json:"token"`
+	}
+
+	var unlockAuthTokenResponse authTokenResponse
+	err = json.Unmarshal(body, &unlockAuthTokenResponse)
+	require.NoError(t, err)
+	assert.NotEmpty(t, unlockAuthTokenResponse.Token)
+
+	req2 := httptest.NewRequest(http.MethodGet, "/api/log/app", nil)
+	req2.Header.Set("Authorization", "Bearer "+unlockAuthTokenResponse.Token)
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+
+	assert.Equal(t, http.StatusForbidden, rec2.Code)
+}
+
+func TestGetLogOutput_FullPermission(t *testing.T) {
+	e := echo.New()
+	logger.Init(strconv.Itoa(int(logrus.DebugLevel)))
+	mockSvc := mocks.NewMockService(t)
+	gormDb, err := db.NewDB(t)
+	require.NoError(t, err)
+	defer db.CloseDB(gormDb)
+
+	mockEventPublisher := events.NewEventPublisher()
+
+	mockConfig := mocks.NewMockConfig(t)
+	mockConfig.On("GetEnv").Return(&config.AppConfig{})
+	mockConfig.On("CheckUnlockPassword", "123").Return(true)
+	mockConfig.On("GetJWTSecret").Return("dummy secret", nil)
+
+	mockSvc.On("GetDB").Return(gormDb)
+	mockSvc.On("GetConfig").Return(mockConfig)
+	mockSvc.On("GetKeys").Return(mocks.NewMockKeys(t))
+	mockSvc.On("GetAlbySvc").Return(mocks.NewMockAlbyService(t))
+	mockSvc.On("GetAlbyOAuthSvc").Return(mocks.NewMockAlbyOAuthService(t))
+	lnClient := mocks.NewMockLNClient(t)
+	lnClient.On("GetNodeStatus", mock.Anything).Return(&lnclient.NodeStatus{}, nil)
+	mockSvc.On("GetLNClient").Return(lnClient)
+
+	httpSvc := NewHttpService(mockSvc, mockEventPublisher)
+	httpSvc.RegisterSharedRoutes(e)
+
+	requestBody := api.UnlockRequest{UnlockPassword: "123", Permission: "full"}
+	jsonBody, _ := json.Marshal(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/unlock", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json") // Set Content-Type header
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	body, err := io.ReadAll(rec.Body)
+	require.NoError(t, err)
+
+	type authTokenResponse struct {
+		Token string `json:"token"`
+	}
+
+	var unlockAuthTokenResponse authTokenResponse
+	err = json.Unmarshal(body, &unlockAuthTokenResponse)
+	require.NoError(t, err)
+	assert.NotEmpty(t, unlockAuthTokenResponse.Token)
+
+	req2 := httptest.NewRequest(http.MethodGet, "/api/log/app", nil)
+	req2.Header.Set("Authorization", "Bearer "+unlockAuthTokenResponse.Token)
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+
+	assert.Equal(t, http.StatusOK, rec2.Code)
+
+	var logResponse api.GetLogOutputResponse
+	err = json.Unmarshal(rec2.Body.Bytes(), &logResponse)
+	require.NoError(t, err)
+}

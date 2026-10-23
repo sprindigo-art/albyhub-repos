@@ -1,0 +1,100 @@
+package transactions
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/getAlby/hub/constants"
+	"github.com/getAlby/hub/db"
+	"github.com/getAlby/hub/lnclient"
+	"github.com/getAlby/hub/tests"
+)
+
+func TestCheckUnsettledTransaction(t *testing.T) {
+	svc, err := tests.CreateTestService(t)
+	require.NoError(t, err)
+	defer svc.Remove()
+
+	dbTransaction := db.Transaction{
+		State:       constants.TRANSACTION_STATE_PENDING,
+		Type:        constants.TRANSACTION_TYPE_OUTGOING,
+		PaymentHash: tests.MockLNClientTransaction.PaymentHash,
+		AmountMsat:  123000,
+	}
+	svc.DB.Create(&dbTransaction)
+
+	mockEventConsumer := tests.NewMockEventConsumer()
+	svc.EventPublisher.RegisterSubscriber(mockEventConsumer)
+	transactionsService := NewTransactionsService(svc.DB, svc.EventPublisher)
+	settledAt := time.Now().Unix()
+	svc.LNClient.(*tests.MockLn).MockTransaction = &lnclient.Transaction{
+		SettledAt: &settledAt,
+		Preimage:  "dummy",
+	}
+
+	// do not allow checking unsettled transactions if notifications are supported
+	transactionsService.checkUnsettledTransaction(context.TODO(), &dbTransaction, svc.LNClient)
+	assert.Equal(t, constants.TRANSACTION_STATE_PENDING, dbTransaction.State)
+
+	svc.LNClient.(*tests.MockLn).SupportedNotificationTypes = &[]string{}
+	transactionsService.checkUnsettledTransaction(context.TODO(), &dbTransaction, svc.LNClient)
+
+	assert.NoError(t, err)
+	assert.Equal(t, constants.TRANSACTION_STATE_SETTLED, dbTransaction.State)
+	consumedEvents := mockEventConsumer.WaitForConsumedEvents(1)
+	assert.Equal(t, 1, len(consumedEvents))
+	assert.Equal(t, "nwc_payment_sent", consumedEvents[0].Event)
+	settledTransaction := consumedEvents[0].Properties.(*db.Transaction)
+	assert.Equal(t, &dbTransaction, settledTransaction)
+}
+
+func TestCheckUnsettledTransactions(t *testing.T) {
+	svc, err := tests.CreateTestService(t)
+	require.NoError(t, err)
+	defer svc.Remove()
+
+	dbTransaction := db.Transaction{
+		State:       constants.TRANSACTION_STATE_PENDING,
+		Type:        constants.TRANSACTION_TYPE_OUTGOING,
+		PaymentHash: tests.MockLNClientTransaction.PaymentHash,
+		AmountMsat:  123000,
+		CreatedAt:   time.Now(),
+	}
+	svc.DB.Create(&dbTransaction)
+
+	mockEventConsumer := tests.NewMockEventConsumer()
+	svc.EventPublisher.RegisterSubscriber(mockEventConsumer)
+	transactionsService := NewTransactionsService(svc.DB, svc.EventPublisher)
+	settledAt := time.Now().Unix()
+
+	svc.LNClient.(*tests.MockLn).MockTransaction = &lnclient.Transaction{
+		SettledAt: &settledAt,
+		Preimage:  "dummy",
+	}
+
+	// do not allow checking unsettled transactions if notifications are supported
+	transactionsService.checkUnsettledTransactions(context.TODO(), svc.LNClient)
+
+	svc.DB.Find(&dbTransaction, db.Transaction{
+		ID: dbTransaction.ID,
+	})
+	assert.Equal(t, constants.TRANSACTION_STATE_PENDING, dbTransaction.State)
+
+	svc.LNClient.(*tests.MockLn).SupportedNotificationTypes = &[]string{}
+	transactionsService.checkUnsettledTransactions(context.TODO(), svc.LNClient)
+
+	svc.DB.Find(&dbTransaction, db.Transaction{
+		ID: dbTransaction.ID,
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, constants.TRANSACTION_STATE_SETTLED, dbTransaction.State)
+	consumedEvents := mockEventConsumer.WaitForConsumedEvents(1)
+	assert.Equal(t, 1, len(consumedEvents))
+	assert.Equal(t, "nwc_payment_sent", consumedEvents[0].Event)
+	settledTransaction := consumedEvents[0].Properties.(*db.Transaction)
+	assert.Equal(t, dbTransaction.ID, settledTransaction.ID)
+}

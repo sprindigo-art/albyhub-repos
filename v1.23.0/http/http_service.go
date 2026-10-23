@@ -1,0 +1,1608 @@
+package http
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	echojwt "github.com/labstack/echo-jwt/v4"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/sirupsen/logrus"
+	"gorm.io/gorm"
+
+	"github.com/getAlby/hub/apps"
+	"github.com/getAlby/hub/config"
+	"github.com/getAlby/hub/events"
+	"github.com/getAlby/hub/logger"
+	"github.com/getAlby/hub/service"
+
+	"github.com/getAlby/hub/api"
+	"github.com/getAlby/hub/frontend"
+)
+
+type authTokenResponse struct {
+	Token string `json:"token"`
+}
+
+type jwtCustomClaims struct {
+	// we can add extra claims here
+	// Name  string `json:"name"`
+	// Admin bool   `json:"admin"`
+	Permission string `json:"permission,omitempty"` // "full" or "readonly"
+	jwt.RegisteredClaims
+}
+
+type HttpService struct {
+	api            api.API
+	albyHttpSvc    *AlbyHttpService
+	cfg            config.Config
+	eventPublisher events.EventPublisher
+	db             *gorm.DB
+	appsSvc        apps.AppsService
+}
+
+func NewHttpService(svc service.Service, eventPublisher events.EventPublisher) *HttpService {
+	return &HttpService{
+		api:            api.NewAPI(svc, svc.GetDB(), svc.GetConfig(), svc.GetKeys(), svc.GetAlbySvc(), svc.GetAlbyOAuthSvc(), eventPublisher),
+		albyHttpSvc:    NewAlbyHttpService(svc, svc.GetAlbySvc(), svc.GetAlbyOAuthSvc(), svc.GetConfig().GetEnv()),
+		cfg:            svc.GetConfig(),
+		eventPublisher: eventPublisher,
+		db:             svc.GetDB(),
+		appsSvc:        apps.NewAppsService(svc.GetDB(), eventPublisher, svc.GetKeys(), svc.GetConfig()),
+	}
+}
+
+func (httpSvc *HttpService) RegisterSharedRoutes(e *echo.Echo) {
+	e.HideBanner = true
+
+	e.Use(middleware.SecureWithConfig(middleware.SecureConfig{
+		ContentTypeNosniff:    "nosniff",
+		XFrameOptions:         "DENY",
+		ContentSecurityPolicy: "default-src 'self'; img-src 'self' https://uploads.getalby-assets.com https://cdn.getalby-assets.com https://getalby.com; connect-src 'self' https://api.getalby.com https://getalby.com https://zapplanner.albylabs.com wss://relay.getalby.com wss://relay2.getalby.com; frame-src https://www.youtube-nocookie.com",
+		ReferrerPolicy:        "no-referrer",
+	}))
+	e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+		LogURI:       true,
+		LogStatus:    true,
+		LogRemoteIP:  true,
+		LogUserAgent: true,
+		LogHost:      true,
+		LogRequestID: true,
+		LogValuesFunc: func(c echo.Context, values middleware.RequestLoggerValues) error {
+			logger.Logger.WithFields(logrus.Fields{
+				"uri":        values.URI,
+				"status":     values.Status,
+				"remote_ip":  values.RemoteIP,
+				"user_agent": values.UserAgent,
+				"host":       values.Host,
+				"request_id": values.RequestID,
+			}).Info("handled API request")
+			return nil
+		},
+	}))
+
+	e.Use(middleware.Recover())
+	e.Use(middleware.RequestID())
+
+	e.GET("/api/info", httpSvc.infoHandler)
+	e.POST("/api/setup", httpSvc.setupHandler)
+	e.POST("/api/restore", httpSvc.restoreBackupHandler)
+
+	// allow one unlock request per second
+	unlockRateLimiter := middleware.RateLimiter(middleware.NewRateLimiterMemoryStore(1))
+	e.POST("/api/start", httpSvc.startHandler, unlockRateLimiter)
+	e.POST("/api/unlock", httpSvc.unlockHandler, unlockRateLimiter)
+	e.POST("/api/backup", httpSvc.createBackupHandler, unlockRateLimiter)
+	e.GET("/logout", httpSvc.logoutHandler, unlockRateLimiter)
+
+	frontend.RegisterHandlers(e)
+
+	// restricted routes
+	// Configure middleware with the custom claims type
+	jwtConfig := echojwt.Config{
+		NewClaimsFunc: func(c echo.Context) jwt.Claims {
+			return new(jwtCustomClaims)
+		},
+		// use a custom key func as the JWT secret will change if the user changes their unlock password
+		KeyFunc: func(token *jwt.Token) (interface{}, error) {
+			secret, err := httpSvc.cfg.GetJWTSecret()
+			if err != nil {
+				return nil, err
+			}
+			return []byte(secret), nil
+		},
+	}
+	// Read-only API group - accessible to both full and readonly tokens
+	readOnlyApiGroup := e.Group("/api")
+	readOnlyApiGroup.Use(echojwt.WithConfig(jwtConfig))
+
+	readOnlyApiGroup.GET("/apps", httpSvc.appsListHandler)
+	readOnlyApiGroup.GET("/apps/:pubkey", httpSvc.appsShowByPubkeyHandler)
+	readOnlyApiGroup.GET("/v2/apps/:id", httpSvc.appsShowHandler)
+	readOnlyApiGroup.GET("/channels", httpSvc.channelsListHandler)
+	readOnlyApiGroup.GET("/channels/suggestions", httpSvc.channelPeerSuggestionsHandler)
+	readOnlyApiGroup.GET("/channel-offer", httpSvc.channelOfferHandler)
+	readOnlyApiGroup.GET("/node/connection-info", httpSvc.nodeConnectionInfoHandler)
+	readOnlyApiGroup.GET("/node/status", httpSvc.nodeStatusHandler)
+	readOnlyApiGroup.GET("/node/network-graph", httpSvc.nodeNetworkGraphHandler)
+	readOnlyApiGroup.GET("/node/transactions", httpSvc.listOnchainTransactionsHandler)
+	readOnlyApiGroup.GET("/peers", httpSvc.listPeers)
+	readOnlyApiGroup.GET("/wallet/address", httpSvc.onchainAddressHandler)
+	readOnlyApiGroup.GET("/wallet/capabilities", httpSvc.capabilitiesHandler)
+	readOnlyApiGroup.GET("/transactions", httpSvc.listTransactionsHandler)
+	readOnlyApiGroup.GET("/transactions/:paymentHash", httpSvc.lookupTransactionHandler)
+	readOnlyApiGroup.GET("/balances", httpSvc.balancesHandler)
+	readOnlyApiGroup.GET("/mempool", httpSvc.mempoolApiHandler)
+	readOnlyApiGroup.GET("/log/:type", httpSvc.getLogOutputHandler)
+	readOnlyApiGroup.GET("/health", httpSvc.healthHandler)
+	readOnlyApiGroup.GET("/commands", httpSvc.getCustomNodeCommandsHandler)
+	readOnlyApiGroup.GET("/swaps", httpSvc.listSwapsHandler)
+	readOnlyApiGroup.GET("/swaps/:swapId", httpSvc.lookupSwapHandler)
+	readOnlyApiGroup.GET("/swaps/out/info", httpSvc.getSwapOutInfoHandler)
+	readOnlyApiGroup.GET("/swaps/in/info", httpSvc.getSwapInInfoHandler)
+	readOnlyApiGroup.GET("/swaps/mnemonic", httpSvc.swapMnemonicHandler)
+	readOnlyApiGroup.GET("/autoswap", httpSvc.getAutoSwapConfigHandler)
+	readOnlyApiGroup.GET("/forwards", httpSvc.forwardsHandler)
+
+	// Full access API group - requires a token with full permissions
+	fullAccessApiGroup := e.Group("/api")
+	fullAccessApiGroup.Use(echojwt.WithConfig(jwtConfig))
+	fullAccessApiGroup.Use(httpSvc.requireFullAccess)
+
+	fullAccessApiGroup.POST("/event", httpSvc.eventHandler)
+	fullAccessApiGroup.PATCH("/unlock-password", httpSvc.changeUnlockPasswordHandler)
+	fullAccessApiGroup.PATCH("/auto-unlock", httpSvc.autoUnlockHandler)
+	fullAccessApiGroup.PATCH("/settings", httpSvc.updateSettingsHandler)
+	fullAccessApiGroup.PATCH("/apps/:pubkey", httpSvc.appsUpdateHandler)
+	fullAccessApiGroup.PATCH("/transactions/:id/labels", httpSvc.setTransactionUserLabelsHandler)
+	fullAccessApiGroup.DELETE("/apps/:pubkey", httpSvc.appsDeleteHandler)
+	fullAccessApiGroup.POST("/transfers", httpSvc.transfersHandler)
+	fullAccessApiGroup.POST("/apps", httpSvc.appsCreateHandler)
+	fullAccessApiGroup.POST("/lightning-addresses", httpSvc.lightningAddressesCreateHandler)
+	fullAccessApiGroup.DELETE("/lightning-addresses/:appId", httpSvc.lightningAddressesDeleteHandler)
+	fullAccessApiGroup.POST("/mnemonic", httpSvc.mnemonicHandler)
+	fullAccessApiGroup.PATCH("/backup-reminder", httpSvc.backupReminderHandler)
+	fullAccessApiGroup.POST("/channels", httpSvc.openChannelHandler)
+	fullAccessApiGroup.POST("/channels/rebalance", httpSvc.rebalanceChannelHandler)
+	fullAccessApiGroup.POST("/lsp-orders", httpSvc.newInstantChannelInvoiceHandler)
+	fullAccessApiGroup.POST("/node/migrate-storage", httpSvc.migrateNodeStorageHandler)
+	fullAccessApiGroup.POST("/peers", httpSvc.connectPeerHandler)
+	fullAccessApiGroup.DELETE("/peers/:peerId", httpSvc.disconnectPeerHandler)
+	fullAccessApiGroup.DELETE("/peers/:peerId/channels/:channelId", httpSvc.closeChannelHandler)
+	fullAccessApiGroup.PATCH("/peers/:peerId/channels/:channelId", httpSvc.updateChannelHandler)
+	fullAccessApiGroup.POST("/wallet/new-address", httpSvc.newOnchainAddressHandler)
+	fullAccessApiGroup.POST("/wallet/redeem-onchain-funds", httpSvc.redeemOnchainFundsHandler)
+	fullAccessApiGroup.POST("/wallet/sign-message", httpSvc.signMessageHandler)
+	fullAccessApiGroup.POST("/wallet/sync", httpSvc.walletSyncHandler)
+	fullAccessApiGroup.POST("/payments/:invoice", httpSvc.sendPaymentHandler)
+	fullAccessApiGroup.POST("/invoices", httpSvc.makeInvoiceHandler)
+	fullAccessApiGroup.POST("/offers", httpSvc.makeOfferHandler)
+	fullAccessApiGroup.POST("/reset-router", httpSvc.resetRouterHandler)
+	fullAccessApiGroup.POST("/stop", httpSvc.stopHandler)
+	fullAccessApiGroup.POST("/command", httpSvc.execCustomNodeCommandHandler)
+	fullAccessApiGroup.POST("/swaps/out", httpSvc.initiateSwapOutHandler)
+	fullAccessApiGroup.POST("/swaps/in", httpSvc.initiateSwapInHandler)
+	fullAccessApiGroup.POST("/swaps/refund", httpSvc.refundSwapHandler)
+	fullAccessApiGroup.POST("/autoswap", httpSvc.enableAutoSwapOutHandler)
+	fullAccessApiGroup.DELETE("/autoswap", httpSvc.disableAutoSwapOutHandler)
+	fullAccessApiGroup.POST("/node/alias", httpSvc.setNodeAliasHandler)
+
+	httpSvc.albyHttpSvc.RegisterSharedRoutes(readOnlyApiGroup, fullAccessApiGroup, e)
+}
+
+func (httpSvc *HttpService) infoHandler(c echo.Context) error {
+	responseBody, err := httpSvc.api.GetInfo(c.Request().Context())
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	authHeader := c.Request().Header.Get("Authorization")
+	if authHeader != "" {
+		parts := strings.Split(authHeader, " ")
+		if parts[0] == "Bearer" {
+			tokenString := parts[1]
+			token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+				secret, err := httpSvc.cfg.GetJWTSecret()
+				if err != nil {
+					return nil, err
+				}
+
+				return []byte(secret), nil
+			})
+			if err != nil {
+				logger.Logger.WithError(err).Error("failed to parse token")
+			}
+			responseBody.Unlocked = err == nil && token != nil && token.Valid
+		}
+	}
+
+	return c.JSON(http.StatusOK, responseBody)
+}
+
+func (httpSvc *HttpService) eventHandler(c echo.Context) error {
+	var sendEventRequest api.SendEventRequest
+	if err := c.Bind(&sendEventRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	httpSvc.api.SendEvent(sendEventRequest.Event, sendEventRequest.Properties)
+
+	return c.NoContent(http.StatusOK)
+}
+
+func (httpSvc *HttpService) mnemonicHandler(c echo.Context) error {
+	var mnemonicRequest api.MnemonicRequest
+	if err := c.Bind(&mnemonicRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	responseBody, err := httpSvc.api.GetMnemonic(mnemonicRequest.UnlockPassword)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, responseBody)
+}
+
+func (httpSvc *HttpService) backupReminderHandler(c echo.Context) error {
+	var backupReminderRequest api.BackupReminderRequest
+	if err := c.Bind(&backupReminderRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.SetNextBackupReminder(&backupReminderRequest)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to store backup reminder: %s", err.Error()),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) startHandler(c echo.Context) error {
+	var startRequest api.StartRequest
+	if err := c.Bind(&startRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	if !httpSvc.cfg.CheckUnlockPassword(startRequest.UnlockPassword) {
+		return c.JSON(http.StatusUnauthorized, ErrorResponse{
+			Message: "Invalid password",
+		})
+	}
+
+	err := httpSvc.cfg.LoadJWTSecret(startRequest.UnlockPassword)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to load JWT secret: %s", err.Error()),
+		})
+	}
+
+	token, err := httpSvc.createJWT(nil, "full")
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to save session: %s", err.Error()),
+		})
+	}
+
+	go httpSvc.api.Start(&startRequest)
+
+	return c.JSON(http.StatusOK, &authTokenResponse{
+		Token: token,
+	})
+}
+
+func (httpSvc *HttpService) unlockHandler(c echo.Context) error {
+	var unlockRequest api.UnlockRequest
+	if err := c.Bind(&unlockRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	if !httpSvc.cfg.CheckUnlockPassword(unlockRequest.UnlockPassword) {
+		return c.JSON(http.StatusUnauthorized, ErrorResponse{
+			Message: "Invalid password",
+		})
+	}
+
+	if unlockRequest.Permission == "" {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: "Permission field is required",
+		})
+	}
+
+	if !slices.Contains([]string{"full", "readonly"}, unlockRequest.Permission) {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: "Permission field is unknown",
+		})
+	}
+
+	_, err := httpSvc.api.GetNodeStatus(c.Request().Context())
+	if err != nil {
+		if errors.Is(err, api.ErrLNClientNotStarted) {
+			return c.JSON(http.StatusBadRequest, ErrorResponse{
+				Message: "Node is not running, start it before unlocking.",
+			})
+		}
+
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	token, err := httpSvc.createJWT(unlockRequest.TokenExpiryDays, unlockRequest.Permission)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to save session: %s", err.Error()),
+		})
+	}
+
+	httpSvc.eventPublisher.Publish(&events.Event{
+		Event: "nwc_unlocked",
+	})
+
+	return c.JSON(http.StatusOK, &authTokenResponse{
+		Token: token,
+	})
+}
+
+func (httpSvc *HttpService) requireFullAccess(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		token := c.Get("user").(*jwt.Token)
+		claims := token.Claims.(*jwtCustomClaims)
+
+		// Allow if no permission specified (backward compatibility) or if full access
+		if claims.Permission == "" || claims.Permission == "full" {
+			return next(c)
+		}
+
+		return c.JSON(http.StatusForbidden, ErrorResponse{
+			Message: "This operation requires full access permissions",
+		})
+	}
+}
+
+func (httpSvc *HttpService) changeUnlockPasswordHandler(c echo.Context) error {
+	var changeUnlockPasswordRequest api.ChangeUnlockPasswordRequest
+	if err := c.Bind(&changeUnlockPasswordRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.ChangeUnlockPassword(&changeUnlockPasswordRequest)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to change unlock password: %s", err.Error()),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) updateSettingsHandler(c echo.Context) error {
+	var updateSettingsRequest api.UpdateSettingsRequest
+	if err := c.Bind(&updateSettingsRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.UpdateSettings(&updateSettingsRequest)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to update settings: %s", err.Error()),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) autoUnlockHandler(c echo.Context) error {
+	var autoUnlockRequest api.AutoUnlockRequest
+	if err := c.Bind(&autoUnlockRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.SetAutoUnlockPassword(autoUnlockRequest.UnlockPassword)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to set auto unlock password: %s", err.Error()),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) createJWT(tokenExpiryDays *uint64, permission string) (string, error) {
+	if !slices.Contains([]string{"full", "readonly"}, permission) {
+		return "", errors.New("invalid token permission")
+	}
+
+	expiryDays := uint64(30)
+	if tokenExpiryDays != nil {
+		expiryDays = *tokenExpiryDays
+	}
+
+	// Set custom claims
+	claims := &jwtCustomClaims{
+		Permission: permission,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour * 24 * time.Duration(expiryDays))),
+		},
+	}
+
+	// Create token with claims
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	if token == nil {
+		return "", errors.New("failed to create token")
+	}
+
+	secret, err := httpSvc.cfg.GetJWTSecret()
+	if err != nil {
+		return "", err
+	}
+
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		return "", err
+	}
+	return signed, nil
+}
+
+func (httpSvc *HttpService) channelsListHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	channels, err := httpSvc.api.ListChannels(ctx)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, channels)
+}
+
+func (httpSvc *HttpService) channelPeerSuggestionsHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	suggestions, err := httpSvc.api.GetChannelPeerSuggestions(ctx)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, suggestions)
+}
+
+func (httpSvc *HttpService) channelOfferHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	suggestions, err := httpSvc.api.GetLSPChannelOffer(ctx)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, suggestions)
+}
+
+func (httpSvc *HttpService) resetRouterHandler(c echo.Context) error {
+	var resetRouterRequest api.ResetRouterRequest
+	if err := c.Bind(&resetRouterRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.ResetRouter(resetRouterRequest.Key)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) stopHandler(c echo.Context) error {
+
+	err := httpSvc.api.Stop()
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) nodeConnectionInfoHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	info, err := httpSvc.api.GetNodeConnectionInfo(ctx)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, info)
+}
+
+func (httpSvc *HttpService) nodeStatusHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	info, err := httpSvc.api.GetNodeStatus(ctx)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, info)
+}
+
+func (httpSvc *HttpService) nodeNetworkGraphHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	nodeIds := strings.Split(c.QueryParam("nodeIds"), ",")
+
+	info, err := httpSvc.api.GetNetworkGraph(ctx, nodeIds)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, info)
+}
+
+func (httpSvc *HttpService) migrateNodeStorageHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+	var migrateNodeStorageRequest api.MigrateNodeStorageRequest
+	if err := c.Bind(&migrateNodeStorageRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.MigrateNodeStorage(ctx, migrateNodeStorageRequest.To)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) balancesHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	balances, err := httpSvc.api.GetBalances(ctx)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, balances)
+}
+
+func (httpSvc *HttpService) sendPaymentHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var payInvoiceRequest api.PayInvoiceRequest
+	if err := c.Bind(&payInvoiceRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+	amountMsat := api.ResolveToMsat(payInvoiceRequest.AmountSat, payInvoiceRequest.AmountMsat, nil, payInvoiceRequest.Amount)
+
+	paymentResponse, err := httpSvc.api.SendPayment(ctx, c.Param("invoice"), amountMsat, payInvoiceRequest.Metadata, payInvoiceRequest.FromAppID)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, paymentResponse)
+}
+
+func (httpSvc *HttpService) makeOfferHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var makeOfferRequest api.MakeOfferRequest
+	if err := c.Bind(&makeOfferRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	offer, err := httpSvc.api.MakeOffer(ctx, makeOfferRequest.Description)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to generate BOLT-12 offer: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, offer)
+}
+
+func (httpSvc *HttpService) makeInvoiceHandler(c echo.Context) error {
+	var makeInvoiceRequest api.MakeInvoiceRequest
+	if err := c.Bind(&makeInvoiceRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	amountMsat := uint64(0)
+	resolvedAmountMsat := api.ResolveToMsat(makeInvoiceRequest.AmountSat, makeInvoiceRequest.AmountMsat, nil, makeInvoiceRequest.Amount)
+	if resolvedAmountMsat != nil {
+		amountMsat = *resolvedAmountMsat
+	}
+
+	invoice, err := httpSvc.api.CreateInvoice(c.Request().Context(), amountMsat, makeInvoiceRequest.Description)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, invoice)
+}
+
+func (httpSvc *HttpService) lookupTransactionHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	transaction, err := httpSvc.api.LookupInvoice(ctx, c.Param("paymentHash"))
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, transaction)
+}
+
+func (httpSvc *HttpService) setTransactionUserLabelsHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var requestData api.SetTransactionUserLabelsRequest
+	if err := c.Bind(&requestData); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	transactionID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: "Invalid transaction ID",
+		})
+	}
+
+	err = httpSvc.api.SetTransactionUserLabels(ctx, uint(transactionID), requestData.Labels)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) listTransactionsHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	limit := uint64(20)
+	offset := uint64(0)
+	var appId *uint
+
+	if limitParam := c.QueryParam("limit"); limitParam != "" {
+		if parsedLimit, err := strconv.ParseUint(limitParam, 10, 64); err == nil {
+			limit = parsedLimit
+		}
+	}
+
+	if offsetParam := c.QueryParam("offset"); offsetParam != "" {
+		if parsedOffset, err := strconv.ParseUint(offsetParam, 10, 64); err == nil {
+			offset = parsedOffset
+		}
+	}
+
+	if appIdParam := c.QueryParam("appId"); appIdParam != "" {
+		if parsedAppId, err := strconv.ParseUint(appIdParam, 10, 64); err == nil {
+			var unsignedAppId = uint(parsedAppId)
+			appId = &unsignedAppId
+		}
+	}
+
+	transactions, err := httpSvc.api.ListTransactions(ctx, appId, limit, offset)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, transactions)
+}
+
+func (httpSvc *HttpService) listOnchainTransactionsHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	transactions, err := httpSvc.api.ListOnchainTransactions(ctx)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, transactions)
+}
+
+func (httpSvc *HttpService) walletSyncHandler(c echo.Context) error {
+	httpSvc.api.SyncWallet()
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) mempoolApiHandler(c echo.Context) error {
+	endpoint := c.QueryParam("endpoint")
+	if endpoint == "" {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: "Invalid pubkey parameter",
+		})
+	}
+
+	response, err := httpSvc.api.RequestMempoolApi(c.Request().Context(), endpoint)
+	if err != nil {
+		logger.Logger.WithField("endpoint", endpoint).WithError(err).Error("Failed to request mempool API")
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to request mempool API: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, response)
+}
+
+func (httpSvc *HttpService) capabilitiesHandler(c echo.Context) error {
+	response, err := httpSvc.api.GetWalletCapabilities(c.Request().Context())
+	if err != nil {
+		logger.Logger.WithError(err).Error("Failed to request wallet capabilities")
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to request wallet capabilities: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, response)
+}
+
+func (httpSvc *HttpService) listPeers(c echo.Context) error {
+	peers, err := httpSvc.api.ListPeers(c.Request().Context())
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to list peers: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, peers)
+}
+
+func (httpSvc *HttpService) connectPeerHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var connectPeerRequest api.ConnectPeerRequest
+	if err := c.Bind(&connectPeerRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.ConnectPeer(ctx, &connectPeerRequest)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to connect peer: %s", err.Error()),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) openChannelHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var openChannelRequest api.OpenChannelRequest
+	if err := c.Bind(&openChannelRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	openChannelResponse, err := httpSvc.api.OpenChannel(ctx, &openChannelRequest)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to open channel: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, openChannelResponse)
+}
+
+func (httpSvc *HttpService) rebalanceChannelHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var rebalanceChannelRequest api.RebalanceChannelRequest
+	if err := c.Bind(&rebalanceChannelRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	rebalanceChannelResponse, err := httpSvc.api.RebalanceChannel(ctx, &rebalanceChannelRequest)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to rebalance channel: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, rebalanceChannelResponse)
+}
+
+func (httpSvc *HttpService) disconnectPeerHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	err := httpSvc.api.DisconnectPeer(ctx, c.Param("peerId"))
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to disconnect peer: %s", err.Error()),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) closeChannelHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	closeChannelResponse, err := httpSvc.api.CloseChannel(ctx, c.Param("peerId"), c.Param("channelId"), c.QueryParam("force") == "true")
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to close channel: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, closeChannelResponse)
+}
+
+func (httpSvc *HttpService) updateChannelHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var updateChannelRequest api.UpdateChannelRequest
+	if err := c.Bind(&updateChannelRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	updateChannelRequest.NodeId = c.Param("peerId")
+	updateChannelRequest.ChannelId = c.Param("channelId")
+
+	err := httpSvc.api.UpdateChannel(ctx, &updateChannelRequest)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to update channel: %s", err.Error()),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) newInstantChannelInvoiceHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var newWrappedInvoiceRequest api.LSPOrderRequest
+	if err := c.Bind(&newWrappedInvoiceRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	newLSPOrderResponse, err := httpSvc.api.RequestLSPOrder(ctx, &newWrappedInvoiceRequest)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to request new channel order from LSP: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, newLSPOrderResponse)
+}
+
+func (httpSvc *HttpService) onchainAddressHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	address, err := httpSvc.api.GetUnusedOnchainAddress(ctx)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to request new onchain address: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, address)
+}
+
+func (httpSvc *HttpService) newOnchainAddressHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	address, err := httpSvc.api.GetNewOnchainAddress(ctx)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to request new onchain address: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, address)
+}
+
+func (httpSvc *HttpService) redeemOnchainFundsHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var redeemOnchainFundsRequest api.RedeemOnchainFundsRequest
+	if err := c.Bind(&redeemOnchainFundsRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	amountSat := uint64(0)
+	resolvedAmountSat := api.ResolveToSat(redeemOnchainFundsRequest.AmountSat, nil, redeemOnchainFundsRequest.Amount, nil)
+	if resolvedAmountSat != nil {
+		amountSat = *resolvedAmountSat
+	}
+
+	redeemOnchainFundsResponse, err := httpSvc.api.RedeemOnchainFunds(ctx, redeemOnchainFundsRequest.ToAddress, amountSat, redeemOnchainFundsRequest.FeeRate, redeemOnchainFundsRequest.SendAll)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to redeem onchain funds: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, redeemOnchainFundsResponse)
+}
+
+func (httpSvc *HttpService) signMessageHandler(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var signMessageRequest api.SignMessageRequest
+	if err := c.Bind(&signMessageRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	signMessageResponse, err := httpSvc.api.SignMessage(ctx, signMessageRequest.Message)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to sign message: %s", err.Error()),
+		})
+	}
+	return c.JSON(http.StatusOK, signMessageResponse)
+}
+
+func (httpSvc *HttpService) appsListHandler(c echo.Context) error {
+	limit := uint64(0)
+	offset := uint64(0)
+
+	if limitParam := c.QueryParam("limit"); limitParam != "" {
+		if parsedLimit, err := strconv.ParseUint(limitParam, 10, 64); err == nil {
+			limit = parsedLimit
+		}
+	}
+
+	if offsetParam := c.QueryParam("offset"); offsetParam != "" {
+		if parsedOffset, err := strconv.ParseUint(offsetParam, 10, 64); err == nil {
+			offset = parsedOffset
+		}
+	}
+
+	filtersJSON := c.QueryParam("filters")
+	var filters api.ListAppsFilters
+	if filtersJSON != "" {
+		err := json.Unmarshal([]byte(filtersJSON), &filters)
+		if err != nil {
+			logger.Logger.WithError(err).WithFields(logrus.Fields{
+				"filters": filtersJSON,
+			}).Error("Failed to deserialize app filters")
+			return err
+		}
+	}
+
+	orderBy := c.QueryParam("order_by")
+
+	apps, err := httpSvc.api.ListApps(limit, offset, filters, orderBy)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, apps)
+}
+
+func (httpSvc *HttpService) appsShowByPubkeyHandler(c echo.Context) error {
+	dbApp := httpSvc.appsSvc.GetAppByPubkey(c.Param("pubkey"))
+
+	if dbApp == nil {
+		return c.JSON(http.StatusNotFound, ErrorResponse{
+			Message: "App not found",
+		})
+	}
+
+	response, err := httpSvc.api.GetApp(dbApp)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, response)
+}
+
+func (httpSvc *HttpService) appsShowHandler(c echo.Context) error {
+	appIdStr := c.Param("id")
+	if appIdStr == "" {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: "App ID is required",
+		})
+	}
+
+	appId, err := strconv.ParseUint(appIdStr, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: "Invalid App ID",
+		})
+	}
+
+	dbApp := httpSvc.appsSvc.GetAppById(uint(appId))
+
+	if dbApp == nil {
+		return c.JSON(http.StatusNotFound, ErrorResponse{
+			Message: "App not found",
+		})
+	}
+
+	response, err := httpSvc.api.GetApp(dbApp)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, response)
+}
+
+func (httpSvc *HttpService) appsUpdateHandler(c echo.Context) error {
+	var requestData api.UpdateAppRequest
+	if err := c.Bind(&requestData); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	dbApp := httpSvc.appsSvc.GetAppByPubkey(c.Param("pubkey"))
+
+	if dbApp == nil {
+		return c.JSON(http.StatusNotFound, ErrorResponse{
+			Message: "App not found",
+		})
+	}
+
+	err := httpSvc.api.UpdateApp(dbApp, &requestData)
+
+	if err != nil {
+		logger.Logger.WithError(err).Error("Failed to update app")
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to update app: %v", err),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) transfersHandler(c echo.Context) error {
+	var requestData api.TransferRequest
+	if err := c.Bind(&requestData); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	amountMsat := uint64(0)
+	resolvedAmountMsat := api.ResolveToMsat(requestData.AmountSat, requestData.AmountMsat, nil, nil)
+	if resolvedAmountMsat != nil {
+		amountMsat = *resolvedAmountMsat
+	}
+
+	err := httpSvc.api.Transfer(c.Request().Context(), requestData.FromAppId, requestData.ToAppId, amountMsat, requestData.Description)
+
+	if err != nil {
+		logger.Logger.WithError(err).Error("Failed to transfer funds")
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to transfer funds: %v", err),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) appsDeleteHandler(c echo.Context) error {
+	dbApp := httpSvc.appsSvc.GetAppByPubkey(c.Param("pubkey"))
+	if dbApp == nil {
+		return c.JSON(http.StatusNotFound, ErrorResponse{
+			Message: "App not found",
+		})
+	}
+
+	if err := httpSvc.api.DeleteApp(dbApp); err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: "Failed to delete app",
+		})
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) appsCreateHandler(c echo.Context) error {
+	var requestData api.CreateAppRequest
+	if err := c.Bind(&requestData); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	responseBody, err := httpSvc.api.CreateApp(&requestData)
+
+	if err != nil {
+		logger.Logger.WithField("requestData", requestData).WithError(err).Error("Failed to save app")
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to save app: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, responseBody)
+}
+
+func (httpSvc *HttpService) lightningAddressesCreateHandler(c echo.Context) error {
+	var requestData api.CreateLightningAddressRequest
+	if err := c.Bind(&requestData); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.CreateLightningAddress(c.Request().Context(), &requestData)
+
+	if err != nil {
+		logger.Logger.WithField("request", requestData).WithError(err).Error("Failed to create lightning address")
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) lightningAddressesDeleteHandler(c echo.Context) error {
+	appIdStr := c.Param("appId")
+	if appIdStr == "" {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: "App ID is required",
+		})
+	}
+
+	appId, err := strconv.ParseUint(appIdStr, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: "Invalid App ID",
+		})
+	}
+
+	err = httpSvc.api.DeleteLightningAddress(c.Request().Context(), uint(appId))
+	if err != nil {
+		logger.Logger.WithField("appId", appId).WithError(err).Error("Failed to delete lightning address")
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) setupHandler(c echo.Context) error {
+	var setupRequest api.SetupRequest
+	if err := c.Bind(&setupRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.Setup(c.Request().Context(), &setupRequest)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to setup node: %s", err.Error()),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) getLogOutputHandler(c echo.Context) error {
+	var getLogRequest api.GetLogOutputRequest
+	if err := c.Bind(&getLogRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	logType := c.Param("type")
+	if logType != api.LogTypeNode && logType != api.LogTypeApp {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Invalid log type parameter: '%s'", logType),
+		})
+	}
+
+	getLogResponse, err := httpSvc.api.GetLogOutput(c.Request().Context(), logType, &getLogRequest)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to get log output: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, getLogResponse)
+}
+
+func (httpSvc *HttpService) getCustomNodeCommandsHandler(c echo.Context) error {
+	nodeCommandsResponse, err := httpSvc.api.GetCustomNodeCommands()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to get node commands: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, nodeCommandsResponse)
+}
+
+func (httpSvc *HttpService) execCustomNodeCommandHandler(c echo.Context) error {
+	var execCommandRequest api.ExecuteCustomNodeCommandRequest
+	if err := c.Bind(&execCommandRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	execCommandResponse, err := httpSvc.api.ExecuteCustomNodeCommand(c.Request().Context(), execCommandRequest.Command)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to execute command: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, execCommandResponse)
+}
+
+func (httpSvc *HttpService) logoutHandler(c echo.Context) error {
+	redirectUrl := httpSvc.cfg.GetEnv().GetBaseFrontendUrl()
+	if redirectUrl == "" {
+		redirectUrl = "/"
+	}
+
+	return c.Redirect(http.StatusFound, redirectUrl)
+}
+
+func (httpSvc *HttpService) createBackupHandler(c echo.Context) error {
+	var backupRequest api.BasicBackupRequest
+	if err := c.Bind(&backupRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	if !httpSvc.cfg.CheckUnlockPassword(backupRequest.UnlockPassword) {
+		return c.JSON(http.StatusUnauthorized, ErrorResponse{
+			Message: "Invalid password",
+		})
+	}
+
+	var buffer bytes.Buffer
+	err := httpSvc.api.CreateBackup(backupRequest.UnlockPassword, &buffer)
+	if err != nil {
+		return c.String(500, fmt.Sprintf("Failed to create backup: %v", err))
+	}
+
+	c.Response().Header().Set("Content-Type", "application/octet-stream")
+	c.Response().Header().Set("Content-Disposition", "attachment; filename=albyhub.bkp")
+	c.Response().WriteHeader(http.StatusOK)
+	c.Response().Write(buffer.Bytes())
+	return nil
+}
+
+func (httpSvc *HttpService) restoreBackupHandler(c echo.Context) error {
+	info, err := httpSvc.api.GetInfo(c.Request().Context())
+	if err != nil {
+		return err
+	}
+	if info.SetupCompleted {
+		return errors.New("setup already completed")
+	}
+
+	password := c.FormValue("unlockPassword")
+
+	fileHeader, err := c.FormFile("backup")
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Failed to get backup file header: %v", err),
+		})
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to open backup file: %v", err),
+		})
+	}
+	defer file.Close()
+
+	err = httpSvc.api.RestoreBackup(password, file)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to restore backup: %v", err),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) healthHandler(c echo.Context) error {
+	healthResponse, err := httpSvc.api.Health(c.Request().Context())
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to check node health: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, healthResponse)
+}
+
+func (httpSvc *HttpService) listSwapsHandler(c echo.Context) error {
+	swaps, err := httpSvc.api.ListSwaps()
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, swaps)
+}
+
+func (httpSvc *HttpService) lookupSwapHandler(c echo.Context) error {
+	swap, err := httpSvc.api.LookupSwap(c.Param("swapId"))
+	if err != nil {
+		return c.JSON(http.StatusNotFound, ErrorResponse{
+			Message: "App not found",
+		})
+	}
+
+	return c.JSON(http.StatusOK, swap)
+}
+
+func (httpSvc *HttpService) getSwapOutInfoHandler(c echo.Context) error {
+	swapOutFeesResponse, err := httpSvc.api.GetSwapOutInfo()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to get swap out info: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, swapOutFeesResponse)
+}
+
+func (httpSvc *HttpService) getSwapInInfoHandler(c echo.Context) error {
+	swapOutFeesResponse, err := httpSvc.api.GetSwapInInfo()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to get swap in info: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, swapOutFeesResponse)
+}
+
+func (httpSvc *HttpService) initiateSwapOutHandler(c echo.Context) error {
+	var initiateSwapOutRequest api.InitiateSwapRequest
+	if err := c.Bind(&initiateSwapOutRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	swapOutResponse, err := httpSvc.api.InitiateSwapOut(c.Request().Context(), &initiateSwapOutRequest)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to initiate swap out: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, swapOutResponse)
+}
+
+func (httpSvc *HttpService) initiateSwapInHandler(c echo.Context) error {
+	var initiateSwapInRequest api.InitiateSwapRequest
+	if err := c.Bind(&initiateSwapInRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	txId, err := httpSvc.api.InitiateSwapIn(c.Request().Context(), &initiateSwapInRequest)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to initiate swap in: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, txId)
+}
+
+func (httpSvc *HttpService) refundSwapHandler(c echo.Context) error {
+	var refundSwapInRequest api.RefundSwapRequest
+	if err := c.Bind(&refundSwapInRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.RefundSwap(&refundSwapInRequest)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) swapMnemonicHandler(c echo.Context) error {
+	mnemonic := httpSvc.api.GetSwapMnemonic()
+	return c.JSON(http.StatusOK, mnemonic)
+}
+
+func (httpSvc *HttpService) getAutoSwapConfigHandler(c echo.Context) error {
+	getAutoSwapConfigResponse, err := httpSvc.api.GetAutoSwapConfig()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to get swap settings: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, getAutoSwapConfigResponse)
+}
+
+func (httpSvc *HttpService) enableAutoSwapOutHandler(c echo.Context) error {
+	var enableAutoSwapRequest api.EnableAutoSwapRequest
+	if err := c.Bind(&enableAutoSwapRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.EnableAutoSwapOut(c.Request().Context(), &enableAutoSwapRequest)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to save swap settings: %v", err),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) disableAutoSwapOutHandler(c echo.Context) error {
+	err := httpSvc.api.DisableAutoSwap()
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: err.Error(),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) setNodeAliasHandler(c echo.Context) error {
+	var setNodeAliasRequest api.SetNodeAliasRequest
+	if err := c.Bind(&setNodeAliasRequest); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Message: fmt.Sprintf("Bad request: %s", err.Error()),
+		})
+	}
+
+	err := httpSvc.api.SetNodeAlias(setNodeAliasRequest.NodeAlias)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to set node alias: %s", err.Error()),
+		})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (httpSvc *HttpService) forwardsHandler(c echo.Context) error {
+	forwards, err := httpSvc.api.GetForwards()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Message: fmt.Sprintf("Failed to get forwards: %s", err.Error()),
+		})
+	}
+
+	return c.JSON(http.StatusOK, forwards)
+}

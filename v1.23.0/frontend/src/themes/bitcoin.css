@@ -1,0 +1,29 @@
+.theme-bitcoin {
+  --radius: 0.5rem;
+
+  --primary: oklch(0.78 0.163 77.82);
+  --primary-foreground: oklch(0.116 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.158 0 0);
+  --chart-1: oklch(0.78 0.163 77.82);
+  --chart-2: oklch(0.765 0.174 62.124);
+  --chart-3: oklch(0.722 0.171 52.177);
+  --chart-4: oklch(0.875 0.173 94.615);
+  --chart-5: oklch(0.645 0.181 38.044);
+  --sidebar-primary: oklch(0.78 0.163 77.82);
+  --sidebar-primary-foreground: oklch(0.116 0 0);
+}
+
+.theme-bitcoin.dark {
+  --primary: oklch(0.78 0.163 77.82);
+  --primary-foreground: oklch(0.116 0 0);
+  --secondary: oklch(0.24 0.004 84.586);
+  --secondary-foreground: oklch(0.985 0 0);
+  --chart-1: oklch(0.78 0.163 77.82);
+  --chart-2: oklch(0.765 0.174 62.124);
+  --chart-3: oklch(0.722 0.171 52.177);
+  --chart-4: oklch(0.875 0.173 94.615);
+  --chart-5: oklch(0.645 0.181 38.044);
+  --sidebar-primary: oklch(0.78 0.163 77.82);
+  --sidebar-primary-foreground: oklch(0.116 0 0);
+}

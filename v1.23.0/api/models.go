@@ -1,0 +1,760 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"io"
+	"time"
+
+	"github.com/getAlby/hub/alby"
+	"github.com/getAlby/hub/db"
+	"github.com/getAlby/hub/swaps"
+)
+
+type API interface {
+	CreateApp(createAppRequest *CreateAppRequest) (*CreateAppResponse, error)
+	UpdateApp(app *db.App, updateAppRequest *UpdateAppRequest) error
+	Transfer(ctx context.Context, fromAppId *uint, toAppId *uint, amountMsat uint64, description string) error
+	DeleteApp(app *db.App) error
+	GetApp(app *db.App) (*App, error)
+	ListApps(limit uint64, offset uint64, filters ListAppsFilters, orderBy string) (*ListAppsResponse, error)
+	CreateLightningAddress(ctx context.Context, createLightningAddressRequest *CreateLightningAddressRequest) error
+	DeleteLightningAddress(ctx context.Context, appId uint) error
+	ListChannels(ctx context.Context) ([]Channel, error)
+	GetChannelPeerSuggestions(ctx context.Context) ([]alby.ChannelPeerSuggestion, error)
+	GetStories(ctx context.Context) ([]alby.Story, error)
+	GetLSPChannelOffer(ctx context.Context) (*alby.LSPChannelOffer, error)
+	ResetRouter(key string) error
+	ChangeUnlockPassword(changeUnlockPasswordRequest *ChangeUnlockPasswordRequest) error
+	SetAutoUnlockPassword(unlockPassword string) error
+	Stop() error
+	GetNodeConnectionInfo(ctx context.Context) (*NodeConnectionInfo, error)
+	GetNodeStatus(ctx context.Context) (*NodeStatus, error)
+	ListPeers(ctx context.Context) ([]PeerDetails, error)
+	ConnectPeer(ctx context.Context, connectPeerRequest *ConnectPeerRequest) error
+	DisconnectPeer(ctx context.Context, peerId string) error
+	OpenChannel(ctx context.Context, openChannelRequest *OpenChannelRequest) (*OpenChannelResponse, error)
+	RebalanceChannel(ctx context.Context, rebalanceChannelRequest *RebalanceChannelRequest) (*RebalanceChannelResponse, error)
+	CloseChannel(ctx context.Context, peerId, channelId string, force bool) (*CloseChannelResponse, error)
+	UpdateChannel(ctx context.Context, updateChannelRequest *UpdateChannelRequest) error
+	MakeOffer(ctx context.Context, description string) (string, error)
+	GetNewOnchainAddress(ctx context.Context) (string, error)
+	GetUnusedOnchainAddress(ctx context.Context) (string, error)
+	SignMessage(ctx context.Context, message string) (*SignMessageResponse, error)
+	RedeemOnchainFunds(ctx context.Context, toAddress string, amountSat uint64, feeRate *uint64, sendAll bool) (*RedeemOnchainFundsResponse, error)
+	GetBalances(ctx context.Context) (*BalancesResponse, error)
+	ListTransactions(ctx context.Context, appId *uint, limit uint64, offset uint64) (*ListTransactionsResponse, error)
+	ListOnchainTransactions(ctx context.Context) ([]OnchainTransaction, error)
+	SendPayment(ctx context.Context, invoice string, amountMsat *uint64, metadata map[string]interface{}, fromAppId *uint) (*SendPaymentResponse, error)
+	CreateInvoice(ctx context.Context, amountMsat uint64, description string) (*MakeInvoiceResponse, error)
+	LookupInvoice(ctx context.Context, paymentHash string) (*LookupInvoiceResponse, error)
+	SetTransactionUserLabels(ctx context.Context, id uint, labels map[string]string) error
+	RequestMempoolApi(ctx context.Context, endpoint string) (interface{}, error)
+	GetInfo(ctx context.Context) (*InfoResponse, error)
+	GetMnemonic(unlockPassword string) (*MnemonicResponse, error)
+	SetNextBackupReminder(backupReminderRequest *BackupReminderRequest) error
+	Start(startRequest *StartRequest)
+	Setup(ctx context.Context, setupRequest *SetupRequest) error
+	GetNetworkGraph(ctx context.Context, nodeIds []string) (NetworkGraphResponse, error)
+	SyncWallet() error
+	GetLogOutput(ctx context.Context, logType string, getLogRequest *GetLogOutputRequest) (*GetLogOutputResponse, error)
+	RequestLSPOrder(ctx context.Context, request *LSPOrderRequest) (*LSPOrderResponse, error)
+	CreateBackup(unlockPassword string, w io.Writer) error
+	RestoreBackup(unlockPassword string, r io.Reader) error
+	MigrateNodeStorage(ctx context.Context, to string) error
+	GetWalletCapabilities(ctx context.Context) (*WalletCapabilitiesResponse, error)
+	Health(ctx context.Context) (*HealthResponse, error)
+	UpdateSettings(updateSettingsRequest *UpdateSettingsRequest) error
+	LookupSwap(swapId string) (*LookupSwapResponse, error)
+	ListSwaps() (*ListSwapsResponse, error)
+	GetSwapInInfo() (*SwapInfoResponse, error)
+	GetSwapOutInfo() (*SwapInfoResponse, error)
+	InitiateSwapIn(ctx context.Context, initiateSwapInRequest *InitiateSwapRequest) (*swaps.SwapResponse, error)
+	InitiateSwapOut(ctx context.Context, initiateSwapOutRequest *InitiateSwapRequest) (*swaps.SwapResponse, error)
+	RefundSwap(refundSwapRequest *RefundSwapRequest) error
+	GetSwapMnemonic() string
+	GetAutoSwapConfig() (*GetAutoSwapConfigResponse, error)
+	EnableAutoSwapOut(ctx context.Context, autoSwapRequest *EnableAutoSwapRequest) error
+	DisableAutoSwap() error
+	SetNodeAlias(nodeAlias string) error
+	GetCustomNodeCommands() (*CustomNodeCommandsResponse, error)
+	ExecuteCustomNodeCommand(ctx context.Context, command string) (interface{}, error)
+	SendEvent(event string, properties interface{})
+	GetForwards() (*GetForwardsResponse, error)
+}
+
+var ErrLNClientNotStarted = errors.New("LNClient not started")
+
+type App struct {
+	ID                       uint       `json:"id"`
+	Name                     string     `json:"name"`
+	Description              string     `json:"description"`
+	AppPubkey                string     `json:"appPubkey"`
+	CreatedAt                time.Time  `json:"createdAt"`
+	UpdatedAt                time.Time  `json:"updatedAt"`
+	LastUsedAt               *time.Time `json:"lastUsedAt"`
+	LastSettledTransactionAt *time.Time `json:"lastSettledTransactionAt"`
+	ExpiresAt                *time.Time `json:"expiresAt"`
+	Scopes                   []string   `json:"scopes"`
+	MaxAmount                uint64     `json:"maxAmount"` // deprecated
+	MaxAmountSat             uint64     `json:"maxAmountSat"`
+	MaxAmountMsat            uint64     `json:"maxAmountMsat"`
+	BudgetUsage              uint64     `json:"budgetUsage"` // deprecated
+	BudgetUsageSat           uint64     `json:"budgetUsageSat"`
+	BudgetUsageMsat          uint64     `json:"budgetUsageMsat"`
+	BudgetRenewal            string     `json:"budgetRenewal"`
+	Isolated                 bool       `json:"isolated"`
+	WalletPubkey             string     `json:"walletPubkey"`
+	UniqueWalletPubkey       bool       `json:"uniqueWalletPubkey"`
+	Balance                  int64      `json:"balance"` // deprecated
+	BalanceSat               int64      `json:"balanceSat"`
+	BalanceMsat              int64      `json:"balanceMsat"`
+	Metadata                 Metadata   `json:"metadata,omitempty"`
+}
+
+type ListAppsFilters struct {
+	Name          string `json:"name"`
+	AppStoreAppId string `json:"appStoreAppId"`
+	Unused        bool   `json:"unused"`
+	SubWallets    *bool  `json:"subWallets"`
+}
+
+type ListAppsResponse struct {
+	Apps             []App  `json:"apps"`
+	TotalCount       uint64 `json:"totalCount"`
+	TotalBalance     *int64 `json:"totalBalance,omitempty"` // deprecated
+	TotalBalanceSat  *int64 `json:"totalBalanceSat,omitempty"`
+	TotalBalanceMsat *int64 `json:"totalBalanceMsat,omitempty"`
+}
+
+type UpdateAppRequest struct {
+	Name            *string   `json:"name"`
+	MaxAmount       *uint64   `json:"maxAmount"` // deprecated
+	MaxAmountSat    *uint64   `json:"maxAmountSat"`
+	MaxAmountMsat   *uint64   `json:"maxAmountMsat"`
+	BudgetRenewal   *string   `json:"budgetRenewal"`
+	ExpiresAt       *string   `json:"expiresAt"`
+	UpdateExpiresAt bool      `json:"updateExpiresAt"`
+	Scopes          []string  `json:"scopes"`
+	Metadata        *Metadata `json:"metadata"`
+	Isolated        *bool     `json:"isolated"`
+}
+
+type TransferRequest struct {
+	AmountSat   *uint64 `json:"amountSat"`
+	AmountMsat  *uint64 `json:"amountMsat"`
+	FromAppId   *uint   `json:"fromAppId"`
+	ToAppId     *uint   `json:"toAppId"`
+	Description string  `json:"description"`
+}
+
+type CreateAppRequest struct {
+	Name           string   `json:"name"`
+	Pubkey         string   `json:"pubkey"`
+	MaxAmount      *uint64  `json:"maxAmount"` // deprecated
+	MaxAmountSat   *uint64  `json:"maxAmountSat"`
+	MaxAmountMsat  *uint64  `json:"maxAmountMsat"`
+	BudgetRenewal  string   `json:"budgetRenewal"`
+	ExpiresAt      string   `json:"expiresAt"`
+	Scopes         []string `json:"scopes"`
+	ReturnTo       string   `json:"returnTo"`
+	Isolated       bool     `json:"isolated"`
+	Metadata       Metadata `json:"metadata,omitempty"`
+	UnlockPassword string   `json:"unlockPassword"`
+}
+
+type CreateLightningAddressRequest struct {
+	Address string `json:"address"`
+	AppId   uint   `json:"appId"`
+}
+
+type InitiateSwapRequest struct {
+	SwapAmount    *uint64 `json:"swapAmount"` // deprecated
+	SwapAmountSat *uint64 `json:"swapAmountSat"`
+	Destination   string  `json:"destination"`
+}
+
+type RefundSwapRequest struct {
+	SwapId  string `json:"swapId"`
+	Address string `json:"address"`
+}
+
+type EnableAutoSwapRequest struct {
+	BalanceThreshold    *uint64 `json:"balanceThreshold"` // deprecated
+	BalanceThresholdSat *uint64 `json:"balanceThresholdSat"`
+	SwapAmount          *uint64 `json:"swapAmount"` // deprecated
+	SwapAmountSat       *uint64 `json:"swapAmountSat"`
+	Destination         string  `json:"destination"`
+	DestinationType     string  `json:"destinationType"`
+	UnlockPassword      string  `json:"unlockPassword"`
+}
+
+type GetAutoSwapConfigResponse struct {
+	Type                string `json:"type"`
+	Enabled             bool   `json:"enabled"`
+	BalanceThreshold    uint64 `json:"balanceThreshold"` // deprecated
+	BalanceThresholdSat uint64 `json:"balanceThresholdSat"`
+	SwapAmount          uint64 `json:"swapAmount"` // deprecated
+	SwapAmountSat       uint64 `json:"swapAmountSat"`
+	Destination         string `json:"destination"`
+}
+
+type SwapInfoResponse struct {
+	AlbyServiceFee     float64 `json:"albyServiceFee"`
+	BoltzServiceFee    float64 `json:"boltzServiceFee"`
+	BoltzNetworkFee    uint64  `json:"boltzNetworkFee"` // deprecated
+	BoltzNetworkFeeSat uint64  `json:"boltzNetworkFeeSat"`
+	MinAmount          uint64  `json:"minAmount"` // deprecated
+	MinAmountSat       uint64  `json:"minAmountSat"`
+	MaxAmount          uint64  `json:"maxAmount"` // deprecated
+	MaxAmountSat       uint64  `json:"maxAmountSat"`
+}
+
+type ListSwapsResponse struct {
+	Swaps []Swap `json:"swaps"`
+}
+
+type LookupSwapResponse = Swap
+
+type Swap struct {
+	Id                 string `json:"id"`
+	Type               string `json:"type"`
+	State              string `json:"state"`
+	Invoice            string `json:"invoice"`
+	SendAmount         uint64 `json:"sendAmount"` // deprecated
+	SendAmountSat      uint64 `json:"sendAmountSat"`
+	ReceiveAmount      uint64 `json:"receiveAmount"` // deprecated
+	ReceiveAmountSat   uint64 `json:"receiveAmountSat"`
+	PaymentHash        string `json:"paymentHash"`
+	DestinationAddress string `json:"destinationAddress"`
+	RefundAddress      string `json:"refundAddress"`
+	LockupAddress      string `json:"lockupAddress"`
+	LockupTxId         string `json:"lockupTxId"`
+	ClaimTxId          string `json:"claimTxId"`
+	AutoSwap           bool   `json:"autoSwap"`
+	BoltzPubkey        string `json:"boltzPubkey"`
+	CreatedAt          string `json:"createdAt"`
+	UpdatedAt          string `json:"updatedAt"`
+	UsedXpub           bool   `json:"usedXpub"`
+}
+
+type StartRequest struct {
+	UnlockPassword string `json:"unlockPassword"`
+}
+
+type UnlockRequest struct {
+	UnlockPassword  string  `json:"unlockPassword"`
+	TokenExpiryDays *uint64 `json:"tokenExpiryDays"`
+	Permission      string  `json:"permission,omitempty"` // "full" or "readonly"
+}
+
+type BackupReminderRequest struct {
+	NextBackupReminder string `json:"nextBackupReminder"`
+}
+
+type SendEventRequest struct {
+	Event      string      `json:"event"`
+	Properties interface{} `json:"properties"`
+}
+
+type SetupRequest struct {
+	LNBackendType  string `json:"backendType"`
+	UnlockPassword string `json:"unlockPassword"`
+
+	Mnemonic           string `json:"mnemonic"`
+	NextBackupReminder string `json:"nextBackupReminder"`
+
+	// LND fields
+	LNDAddress      string `json:"lndAddress"`
+	LNDCertFile     string `json:"lndCertFile"`
+	LNDMacaroonFile string `json:"lndMacaroonFile"`
+
+	// Phoenixd fields
+	PhoenixdAddress       string `json:"phoenixdAddress"`
+	PhoenixdAuthorization string `json:"phoenixdAuthorization"`
+
+	// Cashu fields
+	CashuMintUrl string `json:"cashuMintUrl"`
+
+	// CLN fields
+	CLNAddress      string `json:"clnAddress"`
+	CLNLightningDir string `json:"clnLightningDir"`
+	CLNAddressHold  string `json:"clnAddressHold"`
+}
+
+type CreateAppResponse struct {
+	PairingUri    string   `json:"pairingUri"`
+	PairingSecret string   `json:"pairingSecretKey"`
+	Pubkey        string   `json:"pairingPublicKey"`
+	RelayUrls     []string `json:"relayUrls"`
+	WalletPubkey  string   `json:"walletPubkey"`
+	Lud16         string   `json:"lud16"`
+	Id            uint     `json:"id"`
+	Name          string   `json:"name"`
+	ReturnTo      string   `json:"returnTo"`
+}
+
+type User struct {
+	Email string `json:"email"`
+}
+
+type InfoResponseRelay struct {
+	Url    string `json:"url"`
+	Online bool   `json:"online"`
+}
+
+type InfoResponse struct {
+	BackendType                 string              `json:"backendType"`
+	SetupCompleted              bool                `json:"setupCompleted"`
+	OAuthRedirect               bool                `json:"oauthRedirect"`
+	Running                     bool                `json:"running"`
+	Unlocked                    bool                `json:"unlocked"`
+	AlbyAuthUrl                 string              `json:"albyAuthUrl"`
+	NextBackupReminder          string              `json:"nextBackupReminder"`
+	AlbyUserIdentifier          string              `json:"albyUserIdentifier"`
+	AlbyAccountConnected        bool                `json:"albyAccountConnected"`
+	Version                     string              `json:"version"`
+	Network                     string              `json:"network"`
+	EnableAdvancedSetup         bool                `json:"enableAdvancedSetup"`
+	LdkVssEnabled               bool                `json:"ldkVssEnabled"`
+	VssSupported                bool                `json:"vssSupported"`
+	StartupState                string              `json:"startupState"`
+	StartupError                string              `json:"startupError"`
+	StartupErrorTime            time.Time           `json:"startupErrorTime"`
+	AutoUnlockPasswordSupported bool                `json:"autoUnlockPasswordSupported"`
+	AutoUnlockPasswordEnabled   bool                `json:"autoUnlockPasswordEnabled"`
+	Currency                    string              `json:"currency"`
+	BitcoinDisplayFormat        string              `json:"bitcoinDisplayFormat"`
+	Relays                      []InfoResponseRelay `json:"relays"`
+	NodeAlias                   string              `json:"nodeAlias"`
+	MempoolUrl                  string              `json:"mempoolUrl"`
+	ChainDataSourceType         string              `json:"chainDataSourceType,omitempty"`
+	ChainDataSourceAddress      string              `json:"chainDataSourceAddress,omitempty"`
+	JitChannelsLiquiditySource  string              `json:"jitChannelsLiquiditySource,omitempty"`
+	JitChannelsMinPaymentSizeMsat *uint64           `json:"jitChannelsMinPaymentSizeMsat,omitempty"`
+	JitChannelsMaxPaymentSizeMsat *uint64           `json:"jitChannelsMaxPaymentSizeMsat,omitempty"`
+	JitChannelsEnabled          bool                `json:"jitChannelsEnabled"`
+	HideUpdateBanner            bool                `json:"hideUpdateBanner"`
+	SupportsBolt12              bool                `json:"supportsBolt12"`
+}
+
+type UpdateSettingsRequest struct {
+	Currency             string `json:"currency"`
+	BitcoinDisplayFormat string `json:"bitcoinDisplayFormat"`
+	JitChannelsEnabled   *bool  `json:"jitChannelsEnabled"`
+}
+
+type SetNodeAliasRequest struct {
+	NodeAlias string `json:"nodeAlias"`
+}
+
+type MnemonicRequest struct {
+	UnlockPassword string `json:"unlockPassword"`
+}
+
+type MnemonicResponse struct {
+	Mnemonic string `json:"mnemonic"`
+}
+
+type ChangeUnlockPasswordRequest struct {
+	CurrentUnlockPassword string `json:"currentUnlockPassword"`
+	NewUnlockPassword     string `json:"newUnlockPassword"`
+}
+type AutoUnlockRequest struct {
+	UnlockPassword string `json:"unlockPassword"`
+}
+
+type ConnectPeerRequest struct {
+	Pubkey  string `json:"pubkey"`
+	Address string `json:"address"`
+	Port    uint16 `json:"port"`
+}
+
+type OpenChannelRequest struct {
+	Pubkey     string `json:"pubkey"`
+	AmountSats int64  `json:"amountSats"`
+	Public     bool   `json:"public"`
+}
+
+type OpenChannelResponse struct {
+	FundingTxId string `json:"fundingTxId"`
+}
+
+type CloseChannelResponse struct {
+}
+
+type UpdateChannelRequest struct {
+	ChannelId                                string `json:"channelId"`
+	NodeId                                   string `json:"nodeId"`
+	ForwardingFeeBaseMsat                    uint32 `json:"forwardingFeeBaseMsat"`
+	ForwardingFeeProportionalMillionths      uint32 `json:"forwardingFeeProportionalMillionths"`
+	MaxDustHtlcExposureFromFeeRateMultiplier uint64 `json:"maxDustHtlcExposureFromFeeRateMultiplier"`
+}
+
+type NodeConnectionInfo struct {
+	Pubkey  string `json:"pubkey"`
+	Address string `json:"address"`
+	Port    int    `json:"port"`
+}
+
+type NodeStatus struct {
+	IsReady            bool        `json:"isReady"`
+	InternalNodeStatus interface{} `json:"internalNodeStatus"`
+}
+
+type PeerDetails struct {
+	NodeId      string `json:"nodeId"`
+	Address     string `json:"address"`
+	IsPersisted bool   `json:"isPersisted"`
+	IsConnected bool   `json:"isConnected"`
+}
+
+type OnchainTransaction struct {
+	AmountSat        uint64 `json:"amountSat"`
+	CreatedAt        uint64 `json:"createdAt"`
+	State            string `json:"state"`
+	Type             string `json:"type"`
+	NumConfirmations uint32 `json:"numConfirmations"`
+	TxId             string `json:"txId"`
+}
+
+type PendingBalanceDetails struct {
+	ChannelId     string `json:"channelId"`
+	NodeId        string `json:"nodeId"`
+	Amount        uint64 `json:"amount"` // deprecated
+	AmountSat     uint64 `json:"amountSat"`
+	FundingTxId   string `json:"fundingTxId"`
+	FundingTxVout uint32 `json:"fundingTxVout"`
+}
+
+type RebalanceChannelRequest struct {
+	ReceiveThroughNodePubkey string  `json:"receiveThroughNodePubkey"`
+	AmountSat                *uint64 `json:"amountSat"`
+	AmountMsat               *uint64 `json:"amountMsat"`
+}
+type RebalanceChannelResponse struct {
+	TotalFeeSat  uint64 `json:"totalFeeSat"`
+	TotalFeeMsat uint64 `json:"totalFeeMsat"`
+}
+
+type RedeemOnchainFundsRequest struct {
+	ToAddress string  `json:"toAddress"`
+	Amount    *uint64 `json:"amount"` // deprecated
+	AmountSat *uint64 `json:"amountSat"`
+	FeeRate   *uint64 `json:"feeRate"`
+	SendAll   bool    `json:"sendAll"`
+}
+
+type RedeemOnchainFundsResponse struct {
+	TxId string `json:"txId"`
+}
+
+type OnchainBalanceResponse struct {
+	Spendable                             int64                   `json:"spendable"` // deprecated
+	SpendableSat                          int64                   `json:"spendableSat"`
+	Total                                 int64                   `json:"total"` // deprecated
+	TotalSat                              int64                   `json:"totalSat"`
+	Reserved                              int64                   `json:"reserved"` // deprecated
+	ReservedSat                           int64                   `json:"reservedSat"`
+	PendingBalancesFromChannelClosures    uint64                  `json:"pendingBalancesFromChannelClosures"` // deprecated
+	PendingBalancesFromChannelClosuresSat uint64                  `json:"pendingBalancesFromChannelClosuresSat"`
+	PendingBalancesDetails                []PendingBalanceDetails `json:"pendingBalancesDetails"`
+	PendingSweepBalancesDetails           []PendingBalanceDetails `json:"pendingSweepBalancesDetails"`
+	InternalBalances                      interface{}             `json:"internalBalances"`
+}
+
+type LightningBalanceResponse struct {
+	TotalSpendable           int64 `json:"totalSpendable"` // deprecated
+	TotalSpendableSat        int64 `json:"totalSpendableSat"`
+	TotalSpendableMsat       int64 `json:"totalSpendableMsat"`
+	TotalReceivable          int64 `json:"totalReceivable"` // deprecated
+	TotalReceivableSat       int64 `json:"totalReceivableSat"`
+	TotalReceivableMsat      int64 `json:"totalReceivableMsat"`
+	NextMaxSpendable         int64 `json:"nextMaxSpendable"` // deprecated
+	NextMaxSpendableSat      int64 `json:"nextMaxSpendableSat"`
+	NextMaxSpendableMsat     int64 `json:"nextMaxSpendableMsat"`
+	NextMaxReceivable        int64 `json:"nextMaxReceivable"` // deprecated
+	NextMaxReceivableSat     int64 `json:"nextMaxReceivableSat"`
+	NextMaxReceivableMsat    int64 `json:"nextMaxReceivableMsat"`
+	NextMaxSpendableMPP      int64 `json:"nextMaxSpendableMPP"` // deprecated
+	NextMaxSpendableMPPSat   int64 `json:"nextMaxSpendableMPPSat"`
+	NextMaxSpendableMPPMsat  int64 `json:"nextMaxSpendableMPPMsat"`
+	NextMaxReceivableMPP     int64 `json:"nextMaxReceivableMPP"` // deprecated
+	NextMaxReceivableMPPSat  int64 `json:"nextMaxReceivableMPPSat"`
+	NextMaxReceivableMPPMsat int64 `json:"nextMaxReceivableMPPMsat"`
+}
+
+type BalancesResponse struct {
+	Onchain   OnchainBalanceResponse   `json:"onchain"`
+	Lightning LightningBalanceResponse `json:"lightning"`
+}
+
+type SendPaymentResponse = Transaction
+type MakeInvoiceResponse = Transaction
+type LookupInvoiceResponse = Transaction
+
+type SetTransactionUserLabelsRequest struct {
+	Labels map[string]string `json:"labels"`
+}
+
+type ListTransactionsResponse struct {
+	TotalCount   uint64        `json:"totalCount"`
+	Transactions []Transaction `json:"transactions"`
+}
+
+// TODO: camelCase
+type Transaction struct {
+	ID              uint        `json:"id"`
+	Type            string      `json:"type"`
+	State           string      `json:"state"`
+	Invoice         string      `json:"invoice"`
+	Description     string      `json:"description"`
+	DescriptionHash string      `json:"descriptionHash"`
+	Preimage        *string     `json:"preimage"`
+	PaymentHash     string      `json:"paymentHash"`
+	Amount          uint64      `json:"amount"` // deprecated
+	AmountSat       uint64      `json:"amountSat"`
+	AmountMsat      uint64      `json:"amountMsat"`
+	FeesPaid        uint64      `json:"feesPaid"` // deprecated
+	FeesPaidSat     uint64      `json:"feesPaidSat"`
+	FeesPaidMsat    uint64      `json:"feesPaidMsat"`
+	UpdatedAt       string      `json:"updatedAt"`
+	CreatedAt       string      `json:"createdAt"`
+	SettledAt       *string     `json:"settledAt"`
+	AppId           *uint       `json:"appId"`
+	Metadata        Metadata    `json:"metadata,omitempty"`
+	Boostagram      *Boostagram `json:"boostagram,omitempty"`
+	FailureReason   string      `json:"failureReason"`
+}
+
+type Metadata = map[string]interface{}
+
+type Boostagram struct {
+	AppName        string `json:"appName"`
+	Name           string `json:"name"`
+	Podcast        string `json:"podcast"`
+	URL            string `json:"url"`
+	Episode        string `json:"episode,omitempty"`
+	FeedId         string `json:"feedId,omitempty"`
+	ItemId         string `json:"itemId,omitempty"`
+	Timestamp      int64  `json:"ts,omitempty"`
+	Message        string `json:"message,omitempty"`
+	SenderId       string `json:"senderId"`
+	SenderName     string `json:"senderName"`
+	Time           string `json:"time"`
+	Action         string `json:"action"`
+	ValueSatTotal  int64  `json:"valueSatTotal"`
+	ValueMsatTotal int64  `json:"valueMsatTotal"`
+}
+
+const (
+	LogTypeNode = "node"
+	LogTypeApp  = "app"
+)
+
+type GetLogOutputRequest struct {
+	MaxLen int `query:"maxLen"`
+}
+
+type GetLogOutputResponse struct {
+	Log string `json:"logs"`
+}
+
+type SignMessageRequest struct {
+	Message string `json:"message"`
+}
+
+type SignMessageResponse struct {
+	Message   string `json:"message"`
+	Signature string `json:"signature"`
+}
+
+type PayInvoiceRequest struct {
+	Amount     *uint64  `json:"amount"` // deprecated
+	AmountSat  *uint64  `json:"amountSat"`
+	AmountMsat *uint64  `json:"amountMsat"`
+	Metadata   Metadata `json:"metadata"`
+	FromAppID  *uint    `json:"fromAppId"`
+}
+
+type MakeOfferRequest struct {
+	Description string `json:"description"`
+}
+
+type MakeInvoiceRequest struct {
+	Amount      *uint64 `json:"amount"` // deprecated
+	AmountSat   *uint64 `json:"amountSat"`
+	AmountMsat  *uint64 `json:"amountMsat"`
+	Description string  `json:"description"`
+}
+
+type ResetRouterRequest struct {
+	Key string `json:"key"`
+}
+
+type BasicBackupRequest struct {
+	UnlockPassword string `json:"unlockPassword"`
+}
+
+type BasicRestoreWailsRequest struct {
+	UnlockPassword string `json:"unlockPassword"`
+}
+
+type NetworkGraphResponse = interface{}
+
+type LSPOrderRequest struct {
+	Amount        *uint64 `json:"amount"` // deprecated
+	AmountSat     *uint64 `json:"amountSat"`
+	LSPType       string  `json:"lspType"`
+	LSPIdentifier string  `json:"lspIdentifier"`
+	Public        bool    `json:"public"`
+}
+
+type LSPOrderResponse struct {
+	Invoice              string `json:"invoice"`
+	Fee                  uint64 `json:"fee"` // deprecated
+	FeeSat               uint64 `json:"feeSat"`
+	InvoiceAmount        uint64 `json:"invoiceAmount"` // deprecated
+	InvoiceAmountSat     uint64 `json:"invoiceAmountSat"`
+	IncomingLiquidity    uint64 `json:"incomingLiquidity"` // deprecated
+	IncomingLiquiditySat uint64 `json:"incomingLiquiditySat"`
+	OutgoingLiquidity    uint64 `json:"outgoingLiquidity"` // deprecated
+	OutgoingLiquiditySat uint64 `json:"outgoingLiquiditySat"`
+}
+
+type WalletCapabilitiesResponse struct {
+	Scopes            []string `json:"scopes"`
+	Methods           []string `json:"methods"`
+	NotificationTypes []string `json:"notificationTypes"`
+}
+
+type Channel struct {
+	LocalBalance                                int64       `json:"localBalance"` // deprecated
+	LocalBalanceSat                             int64       `json:"localBalanceSat"`
+	LocalBalanceMsat                            int64       `json:"localBalanceMsat"`
+	LocalSpendableBalance                       int64       `json:"localSpendableBalance"` // deprecated
+	LocalSpendableBalanceSat                    int64       `json:"localSpendableBalanceSat"`
+	LocalSpendableBalanceMsat                   int64       `json:"localSpendableBalanceMsat"`
+	RemoteBalance                               int64       `json:"remoteBalance"` // deprecated
+	RemoteBalanceSat                            int64       `json:"remoteBalanceSat"`
+	RemoteBalanceMsat                           int64       `json:"remoteBalanceMsat"`
+	Id                                          string      `json:"id"`
+	RemotePubkey                                string      `json:"remotePubkey"`
+	FundingTxId                                 string      `json:"fundingTxId"`
+	FundingTxVout                               uint32      `json:"fundingTxVout"`
+	Active                                      bool        `json:"active"`
+	Public                                      bool        `json:"public"`
+	InternalChannel                             interface{} `json:"internalChannel"`
+	Confirmations                               *uint32     `json:"confirmations"`
+	ConfirmationsRequired                       *uint32     `json:"confirmationsRequired"`
+	ForwardingFeeBaseMsat                       uint32      `json:"forwardingFeeBaseMsat"` // expressed only in msat as per Lightning spec
+	ForwardingFeeProportionalMillionths         uint32      `json:"forwardingFeeProportionalMillionths"`
+	UnspendablePunishmentReserve                uint64      `json:"unspendablePunishmentReserve"` // deprecated
+	UnspendablePunishmentReserveSat             uint64      `json:"unspendablePunishmentReserveSat"`
+	CounterpartyUnspendablePunishmentReserve    uint64      `json:"counterpartyUnspendablePunishmentReserve"` // deprecated
+	CounterpartyUnspendablePunishmentReserveSat uint64      `json:"counterpartyUnspendablePunishmentReserveSat"`
+	Error                                       *string     `json:"error"`
+	Status                                      string      `json:"status"`
+	IsOutbound                                  bool        `json:"isOutbound"`
+}
+
+type MigrateNodeStorageRequest struct {
+	To string `json:"to"`
+}
+
+type HealthAlarmKind string
+
+const (
+	HealthAlarmKindAlbyService       HealthAlarmKind = "alby_service"
+	HealthAlarmKindNodeNotReady      HealthAlarmKind = "node_not_ready"
+	HealthAlarmKindChannelsOffline   HealthAlarmKind = "channels_offline"
+	HealthAlarmKindNostrRelayOffline HealthAlarmKind = "nostr_relay_offline"
+	HealthAlarmKindVssNoSubscription HealthAlarmKind = "vss_no_subscription"
+)
+
+type HealthAlarm struct {
+	Kind       HealthAlarmKind `json:"kind"`
+	RawDetails any             `json:"rawDetails,omitempty"`
+}
+
+func NewHealthAlarm(kind HealthAlarmKind, rawDetails any) HealthAlarm {
+	return HealthAlarm{
+		Kind:       kind,
+		RawDetails: rawDetails,
+	}
+}
+
+type HealthResponse struct {
+	Alarms []HealthAlarm `json:"alarms,omitempty"`
+}
+
+type CustomNodeCommandArgDef struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type CustomNodeCommandDef struct {
+	Name        string                    `json:"name"`
+	Description string                    `json:"description"`
+	Args        []CustomNodeCommandArgDef `json:"args"`
+}
+
+type CustomNodeCommandsResponse struct {
+	Commands []CustomNodeCommandDef `json:"commands"`
+}
+
+type ExecuteCustomNodeCommandRequest struct {
+	Command string `json:"command"`
+}
+
+type GetForwardsResponse struct {
+	OutboundAmountForwardedSat  uint64 `json:"outboundAmountForwardedSat"`
+	OutboundAmountForwardedMsat uint64 `json:"outboundAmountForwardedMsat"`
+	TotalFeeEarnedSat           uint64 `json:"totalFeeEarnedSat"`
+	TotalFeeEarnedMsat          uint64 `json:"totalFeeEarnedMsat"`
+	NumForwards                 uint64 `json:"numForwards"`
+}
+
+func ResolveToSat(satValue *uint64, msatValue *uint64, legacyValueSat *uint64, legacyValueMsat *uint64) (resolvedSatValue *uint64) {
+	if legacyValueSat != nil {
+		resolvedSatValue = legacyValueSat
+	}
+
+	if legacyValueMsat != nil {
+		tmpSat := *legacyValueMsat / 1000
+		resolvedSatValue = &tmpSat
+	}
+
+	if satValue != nil {
+		resolvedSatValue = satValue
+	}
+
+	if msatValue != nil {
+		tmpSat := *msatValue / 1000
+		resolvedSatValue = &tmpSat
+	}
+
+	return resolvedSatValue
+}
+
+func ResolveToMsat(satValue *uint64, msatValue *uint64, legacyValueSat *uint64, legacyValueMsat *uint64) (resolvedMsatValue *uint64) {
+	if legacyValueSat != nil {
+		tmpMsat := *legacyValueSat * 1000
+		resolvedMsatValue = &tmpMsat
+	}
+
+	if legacyValueMsat != nil {
+		resolvedMsatValue = legacyValueMsat
+	}
+
+	if satValue != nil {
+		tmpMsat := *satValue * 1000
+		resolvedMsatValue = &tmpMsat
+	}
+
+	if msatValue != nil {
+		resolvedMsatValue = msatValue
+	}
+
+	return resolvedMsatValue
+}

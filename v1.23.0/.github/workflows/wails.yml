@@ -1,0 +1,265 @@
+name: Wails build - all platforms
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    types: [opened, synchronize]
+
+  workflow_call:
+    inputs:
+      build-release:
+        description: "Build full-featured release (codesigning, notarization, etc.)"
+        type: boolean
+    secrets:
+      APPLE_DEVELOPER_CERTIFICATE_P12_BASE64:
+        required: true
+      APPLE_DEVELOPER_CERTIFICATE_PASSWORD:
+        required: true
+      APPLE_PASSWORD:
+        required: true
+      APPLE_TEAM_ID:
+        required: true
+      APPLE_USERNAME:
+        required: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          [
+            { platform: linux/amd64, os: ubuntu-22.04 },
+            { platform: linux/amd64, os: ubuntu-24.04 },
+            { platform: windows/amd64, os: windows-2022 },
+            { platform: darwin/universal, os: macos-14 },
+          ]
+    runs-on: ${{ matrix.build.os }}
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Setup
+        shell: bash
+        run: |
+          echo "EXEC_NAME=Alby Hub" >> $GITHUB_ENV
+          if [ "${{ matrix.build.os }}" == "ubuntu-24.04" ]; then
+            echo "PACKAGE_NAME=albyhub-Desktop-Linux-Ubuntu-24.04" >> $GITHUB_ENV
+            echo "LIBWEBKIT2GTK=libwebkit2gtk-4.1-dev" >> $GITHUB_ENV
+          else
+            echo "PACKAGE_NAME=albyhub-Desktop-${{ runner.os }}" >> $GITHUB_ENV
+            echo "LIBWEBKIT2GTK=libwebkit2gtk-4.0-dev" >> $GITHUB_ENV
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patchelf
+
+      - name: Setup GoLang
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "./go.mod"
+
+      - name: Get dependencies
+        run: go get -v -t -d ./...
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+        shell: bash
+
+      - name: Install Linux Wails deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install libgtk-3-0 ${{ env.LIBWEBKIT2GTK }} gcc-aarch64-linux-gnu
+        shell: bash
+
+      - name: Install macOS Wails deps
+        if: runner.os == 'macOS'
+        run: |
+          brew install create-dmg
+          brew install Bearer/tap/gon
+        shell: bash
+
+      - name: Wails Doctor
+        working-directory: .
+        run: wails doctor
+        shell: bash
+
+      # On Windows, we need the shared libraries to be found in the same directory
+      # as the executable. Wails build will fail otherwise.
+      - name: Copy shared libraries
+        if: runner.os == 'Windows'
+        run: |
+          cp `go list -m -f "{{.Dir}}" github.com/getAlby/ldk-node-go`/ldk_node/x86_64-pc-windows-msvc/ldk_node.dll ./
+        shell: bash
+
+      - name: Copy appicon in place
+        run: mkdir -p build && cp appicon.png build
+        shell: bash
+
+      - name: Build App
+        if: runner.os == 'macOS'
+        run: wails build --platform darwin/universal -webview2 embed -o "${{ env.EXEC_NAME }}" -tags "wails" -ldflags "-X 'github.com/getAlby/hub/version.Tag=${{ env.TAG }}'"
+        shell: bash
+
+      - name: Build App
+        if: runner.os == 'Linux' && matrix.build.os != 'ubuntu-24.04'
+        run: wails build --platform linux/amd64 -webview2 embed -o "${{ env.EXEC_NAME }}" -tags "wails" -ldflags "-X 'github.com/getAlby/hub/version.Tag=${{ env.TAG }}'"
+        shell: bash
+
+      - name: Build App
+        if: runner.os == 'Linux' && matrix.build.os == 'ubuntu-24.04'
+        run: wails build --platform linux/amd64 -webview2 embed -o "${{ env.EXEC_NAME }}" -tags "wails,webkit2_41" -ldflags "-X 'github.com/getAlby/hub/version.Tag=${{ env.TAG }}'"
+        shell: bash
+
+      - name: Build Windows App
+        if: runner.os == 'Windows'
+        run: wails build --platform windows/amd64 -webview2 embed -o "${{ env.EXEC_NAME }}.exe" -tags "wails" -ldflags "-X 'github.com/getAlby/hub/version.Tag=${{ env.TAG }}'"
+        shell: bash
+
+      - name: Import Code-Signing Certificates for macOS
+        if: runner.os == 'macOS'
+        uses: Apple-Actions/import-codesign-certs@v3
+        with:
+          # The certificates in a PKCS12 file encoded as a base64 string
+          p12-file-base64: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_P12_BASE64 }}
+          # The password used to import the PKCS12 file.
+          p12-password: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}
+
+      - name: Copy DLLs to the output directory
+        if: runner.os == 'Windows'
+        run: |
+          cp ldk_node.dll ./build/bin/
+        shell: bash
+
+      - name: Copy shared libraries to the output directory and adjust directory structure
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p ./build/bin/${{ env.PACKAGE_NAME }}/lib
+          cp `go list -m -f "{{.Dir}}" github.com/getAlby/ldk-node-go`/ldk_node/x86_64-unknown-linux-gnu/libldk_node.so ./build/bin/${{ env.PACKAGE_NAME }}/lib/
+          mkdir -p ./build/bin/${{ env.PACKAGE_NAME }}/bin
+          mv "./build/bin/${{ env.EXEC_NAME }}" ./build/bin/${{ env.PACKAGE_NAME }}/bin/
+        shell: bash
+
+      - name: Patch executable RPATH
+        if: runner.os == 'Linux'
+        run: |
+          patchelf --force-rpath --set-rpath '$ORIGIN/../lib' "./build/bin/${{ env.PACKAGE_NAME }}/bin/${{ env.EXEC_NAME }}"
+
+      - name: Copy shared libraries to the output directory
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "./build/bin/${{ env.EXEC_NAME }}.app/Contents/Frameworks"
+          cp `go list -m -f "{{.Dir}}" github.com/getAlby/ldk-node-go`/ldk_node/universal-macos/libldk_node.dylib "./build/bin/${{ env.EXEC_NAME }}.app/Contents/Frameworks/"
+        shell: bash
+
+      - name: Patch executable RPATH
+        if: runner.os == 'macOS'
+        run: |
+          install_name_tool -add_rpath @executable_path/../Frameworks "./build/bin/${{ env.EXEC_NAME }}.app/Contents/MacOS/${{ env.EXEC_NAME }}"
+
+      - name: Add macOS perms
+        if: runner.os == 'macOS'
+        run: chmod +x "build/bin/${{ env.EXEC_NAME }}.app/Contents/MacOS/${{ env.EXEC_NAME }}"
+        shell: bash
+
+      - name: Add Linux perms
+        if: runner.os  == 'Linux'
+        run: chmod +x "build/bin/${{ env.PACKAGE_NAME }}/bin/${{ env.EXEC_NAME }}"
+        shell: bash
+
+      # Store everything in a tar archive to preserve permissions
+      # (specifically, the executable bit on the app executable).
+      - name: Make output tar archive
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p ./build/out
+          tar -cjf ./build/out/${{ env.PACKAGE_NAME }}.tar.bz2 -C ./build/bin .
+          rm -Rf ./build/bin/*
+          mv ./build/out/${{ env.PACKAGE_NAME }}.tar.bz2 ./build/bin/
+
+      - name: Sign the macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          echo "Signing Package"
+          /usr/bin/codesign -s "Developer ID Application: Alby Inc." -f -v --deep --timestamp --options runtime --entitlements ./build/darwin/entitlements.plist "./build/bin/${{ env.EXEC_NAME }}.app"
+        env:
+          AC_USERNAME: ${{ secrets.APPLE_USERNAME }}
+          AC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          AC_PROVIDER: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Make DMG image for macOS
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p ./build/out
+          create-dmg --volname "Alby Hub" --background "./build/darwin/dmgcover.png" --window-pos 200 120 --window-size 800 400 --icon-size 80 --icon "${{ env.EXEC_NAME }}.app" 200 160 --hide-extension "${{ env.EXEC_NAME }}.app" --app-drop-link 600 160 "./build/out/${{ env.PACKAGE_NAME }}.dmg" "./build/bin/${{ env.EXEC_NAME }}.app"
+          rm -Rf ./build/bin/*
+          mv ./build/out/${{ env.PACKAGE_NAME }}.dmg ./build/bin/
+
+      - name: Generate gon-notarize.json
+        if: runner.os == 'macOS'
+        run: |
+          cat > ./build/darwin/gon-notarize.json << EOF
+          {
+            "notarize": [
+              {
+                "path": "./build/bin/${PACKAGE_NAME}.dmg",
+                "bundle_id": "com.getalby.AlbyHub"
+              }
+            ]
+          }
+          EOF
+
+      - name: Notarize the DMG image
+        if: runner.os == 'macOS'
+        run: |
+          echo "Notarizing Zip Files"
+          gon -log-level=info -log-json ./build/darwin/gon-notarize.json
+        env:
+          AC_USERNAME: ${{ secrets.APPLE_USERNAME }}
+          AC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          AC_PROVIDER: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Make Windows ZIP archive
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p ./build/out
+          7z a -tzip ./build/out/${{ env.PACKAGE_NAME }}.zip ./build/bin/*
+          rm -Rf ./build/bin/*
+          mv ./build/out/${{ env.PACKAGE_NAME }}.zip ./build/bin/
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            ./build/bin/${{ env.PACKAGE_NAME }}.tar.bz2
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            ./build/bin/${{ env.PACKAGE_NAME }}.dmg
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            ./build/bin/${{ env.PACKAGE_NAME }}.zip
+          if-no-files-found: error

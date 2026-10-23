@@ -1,0 +1,17 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Alby Hub",
+  "outputfilename": "Alby Hub",
+  "frontend:install": "yarn install",
+  "frontend:build": "yarn build:wails",
+  "frontend:dev:watcher": "yarn dev:wails",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Alby Contributors",
+    "email": "hello@getalby.com"
+  },
+  "info": {
+    "companyName": "Alby Inc.",
+    "productName": "Alby Hub"
+  }
+}

@@ -1,0 +1,68 @@
+package service
+
+import (
+	"context"
+
+	"github.com/getAlby/go-nostr"
+	"github.com/getAlby/hub/events"
+	"github.com/getAlby/hub/logger"
+)
+
+type deleteAppConsumer struct {
+	events.EventSubscriber
+	walletPubkey       string
+	pool               *nostr.SimplePool
+	cancelSubscription func()
+	svc                *service
+}
+
+// When an app is deleted, unsubscribe from events for that app on the relay
+// and publish a deletion event for that app's info event
+func (s *deleteAppConsumer) ConsumeEvent(ctx context.Context, event *events.Event, globalProperties map[string]interface{}) {
+	if event.Event != "nwc_app_deleted" {
+		return
+	}
+	properties, ok := event.Properties.(map[string]interface{})
+	if !ok {
+		logger.Logger.WithField("event", event).Error("Failed to cast event.Properties to map")
+		return
+	}
+	// Note: for legacy apps the deleted app's WalletPubkey is empty and will
+	// not match the master key used for the legacy app subscription, so the
+	// subscription is preserved for any remaining legacy apps.
+	walletPubKey, _ := properties["walletPubkey"].(string)
+	if walletPubKey == "" || walletPubKey != s.walletPubkey {
+		return
+	}
+	id, ok := properties["id"].(uint)
+	if !ok {
+		logger.Logger.WithField("event", event).Error("missing id in properties event")
+		return
+	}
+
+	// no longer need to listen to events for this wallet
+	s.cancelSubscription()
+
+	// remove this consumer as subscriber in eventPublisher
+	s.svc.eventPublisher.RemoveSubscriber(s)
+
+	walletPrivKey, err := s.svc.keys.GetAppWalletKey(id)
+	if err != nil {
+		logger.Logger.WithError(err).WithField("id", id).Error("Failed to calculate app wallet priv key")
+		return
+	}
+
+	// try to delete info event from relays (non-critical if it fails)
+	// get nip47 event info for this app wallet key
+	nip47InfoEvent, err := s.svc.GetNip47Service().GetNip47Info(ctx, s.pool, s.walletPubkey)
+	if err != nil {
+		logger.Logger.WithError(err).Error("Could not get nip47 info event")
+		return
+	}
+	if nip47InfoEvent != nil {
+		err = s.svc.nip47Service.PublishNip47InfoDeletion(ctx, s.pool, walletPubKey, walletPrivKey, nip47InfoEvent.ID)
+		if err != nil {
+			logger.Logger.WithError(err).WithField("event", event).Error("Failed to publish nip47 info deletion")
+		}
+	}
+}
